@@ -1,0 +1,138 @@
+package cloud.mindbox.mobile_sdk.inapp.domain.models
+
+import cloud.mindbox.mobile_sdk.models.Milliseconds
+import cloud.mindbox.mobile_sdk.models.PlaceKey
+import cloud.mindbox.mobile_sdk.monitoring.domain.models.LogRequest
+
+internal data class InAppConfig(
+    val inApps: List<InApp>,
+    val monitoring: List<LogRequest>,
+    val operations: Map<OperationName, OperationSystemName>,
+    val abtests: List<ABTest>,
+)
+
+internal enum class OperationName(val operation: String) {
+    VIEW_PRODUCT("viewProduct"),
+    VIEW_CATEGORY("viewCategory"),
+    SET_CART("setCart"),
+}
+
+@JvmInline
+internal value class OperationSystemName(val systemName: String)
+
+internal data class InApp(
+    val id: String,
+    val isPriority: Boolean,
+    val delayTime: Milliseconds?,
+    val minVersion: Int?,
+    val maxVersion: Int?,
+    val frequency: Frequency,
+    val targeting: TreeTargeting,
+    val form: Form,
+    val tags: Map<String, String>?,
+    val displayConditions: DisplayConditions? = null,
+)
+
+internal enum class DisplayConditions {
+    DIRECT_CALL,
+}
+
+internal data class Frequency(val delay: Delay) {
+    internal sealed class Delay {
+        data object LifetimeDelay : Delay()
+
+        data object OneTimePerSession : Delay()
+
+        data class TimeDelay(val time: Long, val unit: InAppTime) : Delay()
+
+        data object Unlimited : Delay()
+    }
+}
+
+internal data class Form(
+    val variants: List<InAppType>,
+)
+
+internal sealed class InAppType(open val inAppId: String) {
+
+    internal data class WebView(
+        override val inAppId: String,
+        val type: String,
+        val layers: List<Layer>,
+    ) : InAppType(inAppId)
+
+    internal data class Snackbar(
+        override val inAppId: String,
+        val type: String,
+        val layers: List<Layer>,
+        val elements: List<Element>,
+        val position: Position
+    ) : InAppType(inAppId) {
+        internal data class Position(val gravity: Gravity, val margin: Margin) {
+
+            internal data class Margin(
+                val kind: MarginKind,
+                val top: Int,
+                val left: Int,
+                val right: Int,
+                val bottom: Int
+            ) {
+                internal enum class MarginKind {
+                    DP
+                }
+            }
+
+            internal data class Gravity(
+                val horizontal: HorizontalGravity,
+                val vertical: VerticalGravity
+            ) {
+                internal enum class HorizontalGravity {
+                    CENTER
+                }
+
+                internal enum class VerticalGravity {
+                    TOP,
+                    BOTTOM
+                }
+            }
+        }
+    }
+
+    internal data class ModalWindow(
+        override val inAppId: String,
+        val type: String,
+        val layers: List<Layer>,
+        val elements: List<Element>
+    ) : InAppType(inAppId)
+
+    internal data class Embedded(
+        override val inAppId: String,
+        val placeSystemName: PlaceKey,
+        val layers: List<Layer>,
+        val frequency: Frequency,
+        val tags: Map<String, String>?,
+        val isPriority: Boolean,
+    ) : InAppType(inAppId)
+}
+
+internal data class ABTest(
+    val id: String,
+    val minVersion: Int?,
+    val maxVersion: Int?,
+    val salt: String,
+    val variants: List<Variant>,
+) {
+    internal data class Variant(
+        val id: String,
+        val type: String,
+        val kind: VariantKind,
+        val lower: Int,
+        val upper: Int,
+        val inapps: List<String>,
+    ) {
+        enum class VariantKind {
+            ALL,
+            CONCRETE,
+        }
+    }
+}

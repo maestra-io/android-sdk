@@ -1,0 +1,447 @@
+package cloud.mindbox.mobile_sdk.inapp.data.repositories
+
+import androidx.annotation.VisibleForTesting
+import cloud.mindbox.mobile_sdk.Mindbox
+import cloud.mindbox.mobile_sdk.getOrNull
+import cloud.mindbox.mobile_sdk.inapp.data.managers.SessionStorageManager
+import cloud.mindbox.mobile_sdk.inapp.data.managers.data_filler.DataManager
+import cloud.mindbox.mobile_sdk.inapp.data.mapper.InAppMapper
+import cloud.mindbox.mobile_sdk.inapp.data.validators.*
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.FeatureToggleManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.MobileConfigSerializationManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.InAppsSection
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.MobileConfigRepository
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.PageConfig
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.validators.InAppValidator
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InApp
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppConfig
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppTtlData
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewPrewarmManager
+import cloud.mindbox.mobile_sdk.logger.mindboxLogD
+import cloud.mindbox.mobile_sdk.logger.mindboxLogE
+import cloud.mindbox.mobile_sdk.logger.mindboxLogI
+import cloud.mindbox.mobile_sdk.logger.mindboxLogW
+import cloud.mindbox.mobile_sdk.managers.DbManager
+import cloud.mindbox.mobile_sdk.managers.GatewayManager
+import cloud.mindbox.mobile_sdk.managers.InappSettingsManager
+import cloud.mindbox.mobile_sdk.managers.MobileConfigSettingsManager
+import cloud.mindbox.mobile_sdk.models.ConfigVersion
+import cloud.mindbox.mobile_sdk.models.PlaceKey
+import cloud.mindbox.mobile_sdk.models.Milliseconds
+import cloud.mindbox.mobile_sdk.models.TimeSpan
+import cloud.mindbox.mobile_sdk.models.operation.response.*
+import cloud.mindbox.mobile_sdk.monitoring.data.validators.MonitoringValidator
+import cloud.mindbox.mobile_sdk.repository.MindboxPreferences
+import com.android.volley.VolleyError
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import com.google.gson.JsonElement
+
+internal class MobileConfigRepositoryImpl(
+    private val inAppMapper: InAppMapper,
+    private val mobileConfigSerializationManager: MobileConfigSerializationManager,
+    private val inAppValidator: InAppValidator,
+    private val monitoringValidator: MonitoringValidator,
+    private val abTestValidator: ABTestValidator,
+    private val operationNameValidator: OperationNameValidator,
+    private val operationValidator: OperationValidator,
+    private val gatewayManager: GatewayManager,
+    private val defaultDataManager: DataManager,
+    private val ttlParametersValidator: TtlParametersValidator,
+    private val inAppConfigTtlValidator: InAppConfigTtlValidator,
+    private val sessionStorageManager: SessionStorageManager,
+    private val timeSpanPositiveValidator: TimeSpanPositiveValidator,
+    private val mobileConfigSettingsManager: MobileConfigSettingsManager,
+    private val integerPositiveValidator: IntegerPositiveValidator,
+    private val inappSettingsManager: InappSettingsManager,
+    private val featureToggleManager: FeatureToggleManager,
+    private val inAppWebViewPrewarmManager: InAppWebViewPrewarmManager
+) : MobileConfigRepository {
+
+    private val mutex = Mutex()
+
+    private val configState = MutableStateFlow(ConfigState(current = null, lastPublished = null))
+
+    private val configVersions = MutableSharedFlow<ConfigVersion>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    private var configSubscription: Job? = null
+
+    private sealed interface Publication {
+        object Open : Publication
+
+        object AwaitingDownload : Publication
+
+        object Stored : Publication
+    }
+
+    private val publicationLock = Any()
+
+    private var configGeneration = 0L
+
+    private var publication: Publication = Publication.Open
+
+    init {
+        startListening()
+    }
+
+    override fun startListening() {
+        if (configSubscription?.isActive == true) return
+        configSubscription = Mindbox.mindboxScope.launch {
+            MindboxPreferences.inAppConfigFlow
+                .collectLatest { configString ->
+                    processConfigUpdate(configString)
+                }
+        }
+    }
+
+    override suspend fun fetchMobileConfig() {
+        val generation = synchronized(publicationLock) { configGeneration }
+        val downloaded = try {
+            gatewayManager.fetchMobileConfig(configuration = DbManager.listenConfigurations().first())
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            concludeDownload(generation) { storeAfterFailedDownload(error) }
+            throw error
+        }
+        concludeDownload(generation) {
+            MindboxPreferences.inAppConfig = downloaded
+            MindboxPreferences.inAppConfigUpdatedTime = System.currentTimeMillis()
+        }
+    }
+
+    private inline fun concludeDownload(generation: Long, store: () -> Unit) = synchronized(publicationLock) {
+        if (generation != configGeneration) {
+            mindboxLogI("A config download that is no longer awaited concluded, dropping its outcome")
+            return@synchronized
+        }
+        if (publication == Publication.AwaitingDownload) {
+            publication = Publication.Stored
+        }
+        store()
+    }
+
+    private fun storeAfterFailedDownload(error: Throwable) {
+        if (error is VolleyError && error.networkResponse?.statusCode == MobileConfigRepository.CONFIG_NOT_FOUND) {
+            MindboxPreferences.inAppConfig = ""
+            return
+        }
+        if (error is VolleyError) sessionStorageManager.state.configFetchingError = true
+        MindboxPreferences.inAppConfig = MindboxPreferences.inAppConfig
+    }
+
+    private fun isPublishable(inAppConfigString: String): Boolean = when (publication) {
+        Publication.Open -> true
+        Publication.AwaitingDownload -> false
+        Publication.Stored -> inAppConfigString == MindboxPreferences.inAppConfig
+    }
+
+    private suspend fun processConfigUpdate(inAppConfigString: String) {
+        mutex.withLock {
+            val appliedConfig = synchronized(publicationLock) {
+                if (!isPublishable(inAppConfigString)) {
+                    mindboxLogI("The config emitted is not the one the current session stored, not publishing it")
+                    return@withLock
+                }
+                applyConfig(inAppConfigString)
+            }
+            mobileConfigSettingsManager.checkPushTokenKeepalive(config = appliedConfig)
+        }
+    }
+
+    private fun applyConfig(inAppConfigString: String): InAppConfigResponse {
+        this@MobileConfigRepositoryImpl.mindboxLogD(
+            message = "CachedConfig : $inAppConfigString"
+        )
+        val configBlank =
+            mobileConfigSerializationManager.deserializeToConfigDtoBlank(inAppConfigString)
+
+        val filteredConfig = InAppConfigResponse(
+            inApps = runCatching { getInApps(configBlank) }.getOrNull {
+                mindboxLogW("Unable to get inApps $it")
+            },
+            monitoring = runCatching { getMonitoring(configBlank) }.getOrNull {
+                mindboxLogW("Unable to get logs $it")
+            },
+            settings = runCatching { getSettings(configBlank) }.getOrNull {
+                mindboxLogW("Unable to get settings $it")
+            },
+            abtests = runCatching { getABTests(configBlank) }.getOrNull {
+                mindboxLogW("Unable to get abtests $it")
+            },
+        )
+
+        val updatedInAppConfig = inAppMapper.mapToInAppConfig(filteredConfig)
+        mobileConfigSettingsManager.saveSessionTime(config = filteredConfig)
+        inappSettingsManager.applySettings(config = filteredConfig)
+        featureToggleManager.applyToggles(config = filteredConfig)
+        persistOperationsDomain(filteredConfig)
+        val entry = ConfigEntry(
+            config = updatedInAppConfig,
+            isUnavailable = inAppConfigString.isBlank() && sessionStorageManager.state.configFetchingError,
+            version = configState.value.lastPublished?.version?.next() ?: ConfigVersion.FIRST,
+        )
+        configState.value = ConfigState(current = entry, lastPublished = entry)
+        configVersions.tryEmit(entry.version)
+        inAppWebViewPrewarmManager.prewarmResources(updatedInAppConfig)
+        mindboxLogI(message = "Config ${entry.version.number} is ready: $updatedInAppConfig")
+        return filteredConfig
+    }
+
+    override fun listenConfigVersions(): Flow<ConfigVersion> = configVersions
+
+    override fun hasConfig(): Boolean = configState.value.current != null
+
+    override suspend fun getMonitoringSection() = getConfig().monitoring
+
+    override suspend fun getOperations() = getConfig().operations
+
+    override suspend fun getInAppsSection() = getConfig().inApps
+
+    override suspend fun getInAppsSectionIfAvailable(placeSystemName: PlaceKey?): InAppsSection {
+        val entry = awaitConfigEntry(placeSystemName)
+        return InAppsSection(inApps = entry.config.inApps.takeUnless { entry.isUnavailable }, configVersion = entry.version)
+    }
+
+    override suspend fun getConfigForPageIfAvailable(): PageConfig? {
+        val state = configState.value
+        val entry = state.current ?: state.lastPublished ?: return null
+        if (entry.isUnavailable) return null
+        return PageConfig(entry.config, isOfEndedSession = state.current == null)
+    }
+
+    override fun findInAppInCurrentConfig(id: String): InApp? =
+        configState.value.current?.config?.inApps?.firstOrNull { inApp -> inApp.id == id }
+
+    override suspend fun getABTests() = getConfig().abtests
+
+    override fun resetCurrentConfig() {
+        synchronized(publicationLock) {
+            configGeneration++
+            publication = Publication.AwaitingDownload
+            configState.value = ConfigState(current = null, lastPublished = configState.value.lastPublished)
+        }
+    }
+
+    override fun abandonAwaitedDownload(): Boolean = synchronized(publicationLock) {
+        if (publication != Publication.AwaitingDownload) return@synchronized false
+        configGeneration++
+        mindboxLogI("The awaited config download was abandoned, its outcome will be dropped")
+        true
+    }
+
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun getInApps(configBlank: InAppConfigResponseBlank?): List<InAppDto>? {
+        val isValidConfig = inAppConfigTtlValidator.isValid(
+            InAppTtlData(
+                ttl = getInAppTtl(configBlank),
+                shouldCheckInAppTtl = sessionStorageManager.state.configFetchingError
+            )
+        )
+
+        if (!isValidConfig) return emptyList()
+
+        return configBlank?.inApps
+            ?.filter { inAppDtoBlank ->
+                inAppValidator.validateInAppVersion(inAppDtoBlank)
+            }
+            ?.mapNotNull { inAppDtoBlank ->
+                val frequencyDto = if (inAppDtoBlank.frequency.isAbsent()) {
+                    defaultDataManager.fillFrequencyData(null)
+                } else {
+                    mobileConfigSerializationManager.deserializeToFrequencyDto(inAppDtoBlank.frequency, inAppDtoBlank.id)
+                        ?: return@mapNotNull null
+                }
+                val displayConditionsDto = if (inAppDtoBlank.displayConditions.isAbsent()) {
+                    null
+                } else {
+                    mobileConfigSerializationManager.deserializeToDisplayConditionsDto(inAppDtoBlank.displayConditions, inAppDtoBlank.id)
+                        ?: return@mapNotNull null
+                }
+                inAppMapper.mapToInAppDto(
+                    inAppDtoBlank = inAppDtoBlank,
+                    delayTime = inAppDtoBlank.delayTime
+                        ?.let { TimeSpan.fromStringOrNull(it) }
+                        ?.takeIf { timeSpanPositiveValidator.isValid(it) },
+                    formDto = defaultDataManager.fillFormData(
+                        mobileConfigSerializationManager.deserializeToInAppFormDto(
+                            inAppDtoBlank.form,
+                            inAppDtoBlank.id
+                        )
+                    ),
+                    frequencyDto = frequencyDto,
+                    targetingDto = mobileConfigSerializationManager.deserializeToInAppTargetingDto(
+                        inAppDtoBlank.targeting,
+                        inAppDtoBlank.id
+                    ),
+                    displayConditionsDto = displayConditionsDto,
+                )
+            }?.filter { inAppDto ->
+                inAppValidator.validateInApp(inAppDto)
+            }
+    }
+
+    private fun JsonElement?.isAbsent(): Boolean = this == null || isJsonNull
+
+    private fun getMonitoring(configBlank: InAppConfigResponseBlank?): List<LogRequestDto>? =
+        configBlank?.monitoring?.logs?.filter { logRequestDtoBlank ->
+            monitoringValidator.validateLogRequestDtoBlank(logRequestDtoBlank)
+        }?.map { logRequestDtoBlank ->
+            inAppMapper.mapToLogRequestDto(logRequestDtoBlank)
+        }
+
+    private fun getSettings(configBlank: InAppConfigResponseBlank?): SettingsDto {
+        val operations = configBlank?.settings?.operations
+            ?.filter { (name, operation) ->
+                operationNameValidator.isValid(name) &&
+                    operationValidator.isValid(operation)
+            }?.map { (name, operation) ->
+                name!! to OperationDto(operation!!.systemName)
+            }?.toMap()
+            ?: emptyMap()
+
+        val ttl = runCatching { getInAppTtl(configBlank) }.getOrElse {
+            mindboxLogW("Unable to get InAppTtl settings $it")
+            null
+        }
+
+        val slidingExpiration = runCatching { getConfigSession(configBlank) }.getOrNull {
+            mindboxLogW("Unable to get slidingExpiration settings $it")
+        }
+
+        val inappSettings = runCatching { getInappSettings(configBlank) }.getOrNull {
+            mindboxLogW("Unable to get inapp settings $it")
+        }
+
+        val featureToggles = runCatching { getFeatureToggles(configBlank) }.getOrNull {
+            mindboxLogW("Unable to get featureToggles settings $it")
+        }
+
+        val baseAddresses = runCatching { getBaseAddresses(configBlank) }.getOrNull {
+            mindboxLogW("Unable to get baseAddresses settings $it")
+        }
+
+        return SettingsDto(operations, ttl, slidingExpiration, inappSettings, featureToggles, baseAddresses)
+    }
+
+    private fun getBaseAddresses(configBlank: InAppConfigResponseBlank?): BaseAddressesDto? {
+        val operations = configBlank?.settings?.baseAddresses?.operations
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        return BaseAddressesDto(operations = operations)
+    }
+
+    private fun persistOperationsDomain(config: InAppConfigResponse) {
+        val raw = config.settings?.baseAddresses?.operations
+        val stored = MindboxPreferences.operationsDomainFromConfig
+        when (val action = operationsDomainConfigPolicyAction(raw, stored)) {
+            is OperationsDomainConfigPolicyAction.Save -> {
+                mindboxLogD("operationsDomain: saving '${action.value}'")
+                MindboxPreferences.operationsDomainFromConfig = action.value
+            }
+            is OperationsDomainConfigPolicyAction.Clear -> {
+                mindboxLogD("operationsDomain: clearing stored value '$stored'")
+                MindboxPreferences.operationsDomainFromConfig = null
+            }
+            is OperationsDomainConfigPolicyAction.Keep -> {
+                mindboxLogD("operationsDomain: keeping existing value '$stored'")
+            }
+        }
+    }
+
+    private fun getInAppTtl(configBlank: InAppConfigResponseBlank?): TtlDto? =
+        try {
+            configBlank?.settings?.ttl?.takeIf { ttlParametersDtoBlank ->
+                ttlParametersValidator.isValid(ttlParametersDtoBlank)
+            }?.let { ttlParametersDtoBlank ->
+                inAppMapper.mapToTtlDto(ttlParametersDtoBlank)
+            }
+        } catch (e: java.lang.Exception) {
+            mindboxLogE("Error parse inapps ttl", e)
+            null
+        }
+
+    private fun getConfigSession(configBlank: InAppConfigResponseBlank?): SlidingExpirationDto? =
+        try {
+            SlidingExpirationDto(
+                config = configBlank?.settings?.slidingExpiration?.config
+                    ?.takeIf { slidingExpirationConfig ->
+                        timeSpanPositiveValidator.isValid(slidingExpirationConfig)
+                    }
+                    ?.toMillis()
+                    ?.let { Milliseconds(it) },
+                pushTokenKeepalive = configBlank?.settings?.slidingExpiration?.pushTokenKeepalive
+                    ?.takeIf { pushTokenKeepaliveDtoBlank ->
+                        timeSpanPositiveValidator.isValid(pushTokenKeepaliveDtoBlank)
+                    }
+                    ?.toMillis()
+                    ?.let { Milliseconds(it) }
+            )
+        } catch (e: Exception) {
+            mindboxLogE("Error parse config session time", e)
+            null
+        }
+
+    private fun getInappSettings(configBlank: InAppConfigResponseBlank?): InappSettingsDto? =
+        try {
+            InappSettingsDto(
+                maxInappsPerSession = configBlank?.settings?.inappSettings?.maxInappsPerSession
+                    ?.takeIf { maxInappsPerSession ->
+                        integerPositiveValidator.isValid(maxInappsPerSession)
+                    },
+                maxInappsPerDay = configBlank?.settings?.inappSettings?.maxInappsPerDay
+                    ?.takeIf { maxInappsPerDay ->
+                        integerPositiveValidator.isValid(maxInappsPerDay)
+                    },
+                minIntervalBetweenShows = configBlank?.settings?.inappSettings?.minIntervalBetweenShows
+                    ?.takeIf { minIntervalBetweenShows ->
+                        timeSpanPositiveValidator.isValid(minIntervalBetweenShows)
+                    }
+                    ?.toMillis()
+                    ?.let { Milliseconds(it) }
+            )
+        } catch (e: Exception) {
+            mindboxLogE("Error parse config inapp settings", e)
+            null
+        }
+
+    private fun getFeatureToggles(configBlank: InAppConfigResponseBlank?): Map<String, Boolean?>? =
+        configBlank?.settings?.featureToggles?.toggles
+
+    private fun getABTests(configBlank: InAppConfigResponseBlank?): List<ABTestDto> {
+        return try {
+            if (configBlank?.abtests == null) return listOf()
+
+            return configBlank.abtests.takeIf { abtests ->
+                abtests.all { abTestValidator.isValid(it) }
+            } ?: listOf()
+        } catch (e: Exception) {
+            mindboxLogE("Error parse abtests", e)
+            listOf()
+        }
+    }
+
+    private suspend fun getConfig(): InAppConfig = awaitConfigEntry().config
+
+    private suspend fun awaitConfigEntry(placeSystemName: PlaceKey? = null): ConfigEntry {
+        if (configState.value.current == null) {
+            mindboxLogI(placeSystemName?.let { "No config of this session yet, place '$it' waits for it" } ?: "No config of this session yet, waiting for it")
+        }
+        return configState.mapNotNull { state -> state.current }.first()
+    }
+
+    private class ConfigEntry(val config: InAppConfig, val isUnavailable: Boolean, val version: ConfigVersion)
+
+    private class ConfigState(val current: ConfigEntry?, val lastPublished: ConfigEntry?)
+}

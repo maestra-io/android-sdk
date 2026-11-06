@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="mindbox_default_notification_color">#5DA600</color>
+
+    <!-- Maestra brand palette -->
+    <color name="maestra_lime">#97EA2D</color>
+    <color name="maestra_green">#5DA600</color>
+    <color name="maestra_green_dark">#11762D</color>
+    <color name="maestra_green_deep">#05603F</color>
+    <color name="maestra_lime_soft">#EAFBD5</color>
+    <color name="maestra_ink">#101010</color>
+
+    <!-- Light surfaces -->
+    <color name="maestra_background">#F5F5F5</color>
+    <color name="maestra_surface">#FFFFFF</color>
+    <color name="maestra_surface_variant">#E6E6E6</color>
+    <color name="maestra_outline">#A4A3A3</color>
+
+    <!-- Text -->
+    <color name="maestra_text_primary">#101010</color>
+    <color name="maestra_text_secondary">#666666</color>
+
+    <!-- Dark surfaces -->
+    <color name="maestra_dark_background">#101010</color>
+    <color name="maestra_dark_surface">#1A1A1A</color>
+    <color name="maestra_dark_surface_variant">#333333</color>
+    <color name="maestra_dark_outline">#666666</color>
+    <color name="maestra_dark_on_surface">#F5F5F5</color>
+</resources>

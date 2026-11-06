@@ -1,0 +1,93 @@
+package cloud.mindbox.mobile_sdk.models.operation.request
+
+import com.google.gson.annotations.SerializedName
+
+internal data class InAppShowRequest(
+    @SerializedName("inappId")
+    val inAppId: String,
+    @SerializedName("timeToDisplay")
+    val timeToDisplay: String,
+    @SerializedName("tags")
+    val tags: Map<String, String>?
+)
+
+internal data class InAppClickRequest(
+    @SerializedName("inappId")
+    val inAppId: String,
+    @SerializedName("tags")
+    val tags: Map<String, String>?
+)
+
+internal data class InAppTargetingRequest(
+    @SerializedName("inappId")
+    val inAppId: String,
+    @SerializedName("tags")
+    val tags: Map<String, String>? = null
+)
+
+internal sealed interface InAppShowError
+
+internal data class InAppShowFailure(
+    @SerializedName("inappId")
+    val inAppId: String,
+    @SerializedName("failureReason")
+    val failureReason: FailureReason,
+    @SerializedName("errorDetails")
+    val errorDetails: String?,
+    @SerializedName("dateTimeUtc")
+    val dateTimeUtc: String,
+    @SerializedName("tags")
+    val tags: Map<String, String>? = null,
+    @SerializedName("${"$"}type")
+    val type: String = INAPP_SHOW_FAILURE_TYPE
+) : InAppShowError {
+    internal companion object {
+        const val INAPP_SHOW_FAILURE_TYPE = "inappShowFailure"
+    }
+}
+
+internal data class EmbeddedBlockShowFailure(
+    @SerializedName("placeSystemName")
+    val placeSystemName: String,
+    @SerializedName("failureReason")
+    val failureReason: FailureReason,
+    @SerializedName("errorDetails")
+    val errorDetails: String?,
+    @SerializedName("dateTimeUtc")
+    val dateTimeUtc: String,
+    @SerializedName("${"$"}type")
+    val type: String = EMBEDDED_BLOCK_SHOW_FAILURE_TYPE
+) : InAppShowError {
+    internal companion object {
+        const val EMBEDDED_BLOCK_SHOW_FAILURE_TYPE = "embeddedBlockShowFailure"
+    }
+}
+
+internal enum class FailureReason(val value: String) {
+    @SerializedName("image_download_failed")
+    IMAGE_DOWNLOAD_FAILED("image_download_failed"),
+
+    @SerializedName("presentation_failed")
+    PRESENTATION_FAILED("presentation_failed"),
+
+    @SerializedName("geo_request_failed")
+    GEO_TARGETING_FAILED("geo_request_failed"),
+
+    @SerializedName("customer_segmentation_request_failed")
+    CUSTOMER_SEGMENT_REQUEST_FAILED("customer_segmentation_request_failed"),
+
+    @SerializedName("product_segmentation_request_failed")
+    PRODUCT_SEGMENT_REQUEST_FAILED("product_segmentation_request_failed"),
+
+    @SerializedName("webview_load_failed")
+    WEBVIEW_LOAD_FAILED("webview_load_failed"),
+
+    @SerializedName("webview_presentation_failed")
+    WEBVIEW_PRESENTATION_FAILED("webview_presentation_failed"),
+
+    @SerializedName("wait_budget_exceeded")
+    WAIT_BUDGET_EXCEEDED("wait_budget_exceeded"),
+
+    @SerializedName("unknown_error")
+    UNKNOWN_ERROR("unknown_error")
+}

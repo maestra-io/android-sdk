@@ -1,0 +1,141 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.google.gms.google-services'
+}
+
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { stream ->
+        keystoreProperties.load(stream)
+    }
+}
+
+def examplePropertiesFile = rootProject.file("example.properties")
+def exampleProperties = new Properties()
+if (examplePropertiesFile.exists()) {
+    examplePropertiesFile.withInputStream { stream ->
+        exampleProperties.load(stream)
+    }
+}
+
+
+def exampleVersionName = EXAMPLE_VERSION_NAME_FALLBACK
+def sdkPropertiesFile = rootProject.file("../gradle.properties")
+if (sdkPropertiesFile.exists()) {
+    def sdkProperties = new Properties()
+    sdkPropertiesFile.withInputStream { stream ->
+        sdkProperties.load(stream)
+    }
+    exampleVersionName = sdkProperties.getProperty('SDK_VERSION_NAME', exampleVersionName)
+}
+
+android {
+    namespace 'com.mindbox.example'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "io.maestra.example"
+        minSdk 21
+        targetSdk 36
+        versionCode EXAMPLE_VERSION_CODE.toInteger()
+        // versionName is taken from SDK_VERSION_NAME in the android-sdk repo root
+        // gradle.properties; if it cannot be read (e.g. the example is built outside
+        // the repo), it falls back to EXAMPLE_VERSION_NAME_FALLBACK.
+        versionName exampleVersionName
+        multiDexEnabled true
+
+        buildConfigField "String", "MINDBOX_DOMAIN", "\"${exampleProperties.getProperty('mindbox.domain', '')}\""
+        buildConfigField "String", "MINDBOX_ENDPOINT_ID", "\"${exampleProperties.getProperty('mindbox.endpointId', '')}\""
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildFeatures {
+        buildConfig = true
+        compose = true
+    }
+    composeOptions {
+        // Compose compiler compatible with Kotlin 1.9.22
+        kotlinCompilerExtensionVersion = '1.5.10'
+    }
+    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+}
+// If the version of firebase-bom used in the sdk is higher, then it will be applied
+// To change the dependency resolution strategy use the code below
+/* configurations.configureEach {
+    resolutionStrategy {
+        force 'com.google.firebase:firebase-bom:32.7.1'
+    }
+} */
+dependencies {
+
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+
+    implementation platform('androidx.compose:compose-bom:2024.06.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.activity:activity-compose:1.9.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.2'
+    // Coil for async image loading in Compose
+    implementation 'io.coil-kt:coil-compose:2.6.0'
+
+    // Push services
+    implementation platform('com.google.firebase:firebase-bom:32.7.1')
+    implementation 'com.google.firebase:firebase-analytics-ktx'
+    implementation 'com.google.firebase:firebase-messaging-ktx'
+
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // Maestra SDK
+    implementation 'cloud.mindbox:mobile-sdk:2.16.0'
+    implementation 'cloud.mindbox:mindbox-firebase'
+
+    // Glide for custom loader
+    implementation 'com.github.bumptech.glide:glide:4.15.1'
+    implementation 'androidx.activity:activity-ktx:1.9.0'
+    annotationProcessor 'com.github.bumptech.glide:compiler:4.15.1'
+
+    // Multidex
+    implementation "androidx.multidex:multidex:2.0.1"
+}

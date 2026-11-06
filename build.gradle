@@ -1,0 +1,75 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url "https://plugins.gradle.org/m2/" }
+        maven { url "https://developer.huawei.com/repo/" }
+        maven { url "https://nexus-external.rustore.ru/repository/maven-rustore-exposed" }
+    }
+    dependencies {
+        classpath libs.bundles.buildscript.plugins
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url "https://developer.huawei.com/repo/" }
+        maven { url "https://nexus-external.rustore.ru/repository/maven-rustore-exposed" }
+        maven { url "https://central.sonatype.com/repository/maven-snapshots/" }
+        mavenLocal()
+    }
+}
+
+project(':mindbox-common') {
+    apply plugin: 'io.gitlab.arturbosch.detekt'
+
+    detekt {
+        buildUponDefaultConfig = true
+        config.setFrom(rootProject.files("detekt.yml"))
+    }
+
+    dependencies {
+        detektPlugins project(path: ':detekt-rules', configuration: 'runtimeElements')
+    }
+
+    tasks.register('detektDebug') {
+        dependsOn 'detektAndroidDebug'
+    }
+}
+
+apply plugin: 'org.jetbrains.kotlinx.kover'
+apply plugin: 'org.jetbrains.dokka'
+
+def publishedAndroidModules = [
+    ':sdk',
+    ':mindbox-firebase',
+    ':mindbox-huawei',
+    ':mindbox-rustore',
+    ':mindbox-firebase-starter',
+    ':mindbox-huawei-starter',
+    ':mindbox-rustore-starter',
+    ':mindbox-sdk-starter-core',
+    ':mindbox-embedded-compose',
+]
+
+publishedAndroidModules.each { path ->
+    project(path) {
+        apply plugin: 'org.jetbrains.dokka'
+    }
+    dependencies {
+        kover(project(path))
+        dokka(project(path))
+    }
+}
+
+kover {
+    currentProject {
+        createVariant("coverage") {}
+    }
+}
+
+dokka {
+    moduleName.set('Mindbox Android SDK')
+}

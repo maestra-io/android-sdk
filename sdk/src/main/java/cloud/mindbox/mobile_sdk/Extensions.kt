@@ -1,0 +1,344 @@
+package cloud.mindbox.mobile_sdk
+
+import android.app.Activity
+import android.app.ActivityManager
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.PackageManager.PackageInfoFlags
+import android.content.res.Resources
+import android.os.Build
+import android.os.Looper
+import android.os.Process
+import android.view.View
+import android.view.ViewGroup
+import android.view.animation.Animation
+import android.view.animation.Animation.AnimationListener
+import androidx.annotation.IdRes
+import androidx.core.app.NotificationCompat
+import cloud.mindbox.mobile_sdk.Mindbox.logE
+import cloud.mindbox.mobile_sdk.Mindbox.logW
+import cloud.mindbox.mobile_sdk.inapp.domain.models.Frequency
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InApp
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppType
+import cloud.mindbox.mobile_sdk.inapp.domain.models.Layer
+import cloud.mindbox.mobile_sdk.logger.MindboxLoggerImpl
+import cloud.mindbox.mobile_sdk.pushes.PushNotificationManager.EXTRA_UNIQ_PUSH_BUTTON_KEY
+import cloud.mindbox.mobile_sdk.pushes.PushNotificationManager.EXTRA_UNIQ_PUSH_KEY
+import cloud.mindbox.mobile_sdk.pushes.PushNotificationManager.IS_OPENED_FROM_PUSH_BUNDLE_KEY
+import cloud.mindbox.mobile_sdk.utils.loggingRunCatching
+import com.android.volley.VolleyError
+import com.android.volley.toolbox.HttpHeaderParser
+import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.reflect.TypeToken
+import org.threeten.bp.Instant
+import org.threeten.bp.LocalDateTime
+import org.threeten.bp.ZoneOffset
+import org.threeten.bp.ZonedDateTime
+import org.threeten.bp.format.DateTimeFormatter
+import java.net.URLEncoder
+import java.nio.charset.Charset
+import java.util.Collections
+import java.util.Queue
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
+
+internal fun LinkedHashMap<String, String>.toUrlQueryString(): String = loggingRunCatching(
+    defaultValue = ""
+) {
+    this.map { (k, v) -> "${k.encode()}=${v.encode()}" }
+        .joinToString(prefix = "?", separator = "&")
+}
+
+internal fun String.encode(): String = URLEncoder.encode(this, "UTF-8")
+
+internal fun ZonedDateTime.convertToString() = runCatching {
+    this.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+}.getOrElse {
+    MindboxLoggerImpl.e("Mindbox", "Error converting date", it)
+    ""
+}
+
+internal fun Instant.convertToZonedDateTimeAtUTC(): ZonedDateTime {
+    return ZonedDateTime.ofInstant(this, ZoneOffset.UTC)
+}
+
+internal fun String.convertToZonedDateTime(): ZonedDateTime = runCatching {
+    return LocalDateTime.parse(this, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")).atZone(
+        ZoneOffset.UTC
+    )
+}.getOrElse {
+    MindboxLoggerImpl.e("Mindbox", "Error converting date", it)
+    LocalDateTime.parse("1970-01-01T00:00:00", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))
+        .atZone(
+            ZoneOffset.UTC
+        )
+}
+
+internal fun String.convertToZonedDateTimeWithZ(): ZonedDateTime = runCatching {
+    return LocalDateTime.parse(this, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .atZone(
+            ZoneOffset.UTC
+        )
+}.getOrElse {
+    MindboxLoggerImpl.e("Mindbox", "Error converting date", it)
+    LocalDateTime.parse("1970-01-01T00:00:00", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))
+        .atZone(
+            ZoneOffset.UTC
+        )
+}
+
+internal fun String?.equalsAny(vararg values: String, ignoreCase: Boolean = false): Boolean = values.any { this?.equals(it, ignoreCase) == true }
+
+internal inline fun <reified T : Enum<T>> String?.enumValue(default: T? = null): T = this?.let {
+    enumValues<T>().firstOrNull { value ->
+        value.name
+            .replace("_", "")
+            .equals(
+                this.replace("_", "").trim(),
+                ignoreCase = true
+            )
+    }
+} ?: default ?: throw IllegalArgumentException("Value for $this could not be found")
+
+internal fun Double?.isInRange(start: Double, end: Double): Boolean {
+    if (this == null) return false
+    return this in start..end
+}
+
+internal fun Context.isMainProcess(processName: String?): Boolean {
+    val mainProcessName = getString(R.string.mindbox_android_process).ifBlank { packageName }
+    return processName?.equalsAny(
+        mainProcessName,
+        "$packageName:$mainProcessName",
+        "$packageName$mainProcessName",
+    ) ?: false
+}
+
+internal fun Context.getCurrentProcessName(): String? {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        return Application.getProcessName()
+    }
+
+    val mypid = Process.myPid()
+    val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val processes = manager.runningAppProcesses
+
+    return processes.firstOrNull { info -> info.pid == mypid }?.processName
+}
+
+internal fun View.setSingleClickListener(listener: View.OnClickListener) {
+    setOnClickListener {
+        setOnClickListener(null)
+        listener.onClick(it)
+    }
+}
+internal typealias SnackbarPosition = InAppType.Snackbar.Position.Gravity.VerticalGravity
+
+internal fun InAppType.Snackbar.isTop(): Boolean {
+    return position.gravity.vertical == SnackbarPosition.TOP
+}
+
+internal val Double.px: Double
+    get() = (this * Resources.getSystem().displayMetrics.density)
+
+internal val Int.dp: Int
+    get() = (this / Resources.getSystem().displayMetrics.density).toInt()
+internal val Int.px: Int
+    get() = (this * Resources.getSystem().displayMetrics.density).roundToInt()
+
+internal fun Context.maxScreenDimension(): Int {
+    val displayMetrics = applicationContext.resources.displayMetrics
+    return maxOf(displayMetrics.widthPixels, displayMetrics.heightPixels)
+}
+
+internal fun Animation.setOnAnimationEnd(runnable: Runnable) {
+    setAnimationListener(object : AnimationListener {
+        override fun onAnimationStart(animation: Animation?) {
+        }
+
+        override fun onAnimationEnd(animation: Animation?) {
+            runnable.run()
+        }
+
+        override fun onAnimationRepeat(animation: Animation?) {
+        }
+    })
+}
+
+internal fun ViewGroup.removeChildById(
+    @IdRes viewId: Int
+) = removeView(findViewById(viewId))
+
+internal val Activity?.root: ViewGroup?
+    get() = this?.window?.decorView?.rootView as ViewGroup?
+
+internal inline fun <T> Queue<T>.addUnique(
+    item: T,
+    predicate: (T) -> Boolean = { it == item }
+): Boolean {
+    if (any(predicate)) return false
+    add(item)
+    return true
+}
+
+internal fun PackageManager.getPackageInfoCompat(context: Context, flags: Int): PackageInfo {
+    return if (Build.VERSION_CODES.TIRAMISU <= Build.VERSION.SDK_INT) {
+        getPackageInfo(context.packageName, PackageInfoFlags.of(flags.toLong()))
+    } else {
+        getPackageInfo(context.packageName, flags)
+    }
+}
+
+internal fun VolleyError.getErrorResponseBodyData(): String {
+    return this.networkResponse?.data
+        ?.takeIf { it.isNotEmpty() }
+        ?.toString(
+            Charset.forName(
+                HttpHeaderParser.parseCharset(
+                    this.networkResponse?.headers ?: emptyMap()
+                )
+            )
+        )
+        ?: ""
+}
+
+internal fun verifyThreadExecution(methodName: String, shouldBeMainThread: Boolean = true) {
+    val isMainThread = Looper.myLooper() == Looper.getMainLooper()
+    when {
+        shouldBeMainThread && !isMainThread -> logE("Method $methodName must be called on the main thread")
+        !shouldBeMainThread && isMainThread -> logW("Method $methodName should not be called on the main thread")
+    }
+}
+
+internal fun String.isUuid(): Boolean {
+    return loggingRunCatching(false) {
+        UUID.fromString(this)
+        true
+    }
+}
+
+internal inline fun <reified T> Gson.fromJson(json: JsonElement?): Result<T> = runCatching {
+    fromJson(json, object : TypeToken<T>() {}.type)
+}
+
+internal inline fun <reified T> Gson.fromJson(json: String?): Result<T> = runCatching {
+    fromJson(json, object : TypeToken<T>() {}.type)
+}
+
+internal fun JsonObject.getOrNull(memberName: String?): JsonElement? = runCatching {
+    this.get(memberName)
+}.getOrNull()
+
+internal inline fun <T> Result<T>.getOrNull(runIfNull: (Throwable) -> Unit): T? = getOrElse {
+    runIfNull(it)
+    null
+}
+
+internal fun Context.findActivity(): Activity? =
+    generateSequence(this) { current -> current.safeAs<android.content.ContextWrapper>()?.baseContext }
+        .filterIsInstance<Activity>()
+        .firstOrNull()
+
+internal inline fun <reified T> Any?.safeAs(): T? {
+    return this as? T
+}
+
+/**
+ * Adds Maestra push button unique keys extras to the [Intent].
+ *
+ * This extension function adds both the unique push key and the unique push button key
+ * to the Intent extras. These extras are used by the Maestra SDK to properly identify
+ * and handle push notification button clicks.
+ *
+ * Note: If your push notification contains multiple buttons, you must call this method
+ * for each button with its corresponding unique button key and use intent into [NotificationCompat.Builder.addAction]
+ *
+ * @param pushUniqKey the unique identifier for the push notification.
+ * @param pushButtonKey the unique identifier for the push button.
+ */
+public fun Intent.putMindboxPushButtonExtras(pushUniqKey: String, pushButtonKey: String?) {
+    this.apply {
+        putExtra(EXTRA_UNIQ_PUSH_KEY, pushUniqKey)
+        putExtra(EXTRA_UNIQ_PUSH_BUTTON_KEY, pushButtonKey)
+        putExtra(IS_OPENED_FROM_PUSH_BUNDLE_KEY, true)
+    }
+}
+
+/**
+ * Adds Maestra push extras to the [Intent].
+ *
+ * This extension function adds the unique push key to the Intent extras. This extra is
+ * used by the Maestra SDK to properly identify and handle a push notification clicks that does not
+ * include any push buttons.
+ *
+ * Note: Use this method before calling [NotificationCompat.Builder.setContentIntent]
+ * @param pushUniqKey the unique identifier for the push notification.
+ */
+public fun Intent.putMindboxPushExtras(pushUniqKey: String) {
+    this.apply {
+        putExtra(EXTRA_UNIQ_PUSH_KEY, pushUniqKey)
+        putExtra(IS_OPENED_FROM_PUSH_BUNDLE_KEY, true)
+    }
+}
+
+public fun Intent.getMindboxUniqKeyFromPushIntent(): String? = this.getStringExtra(EXTRA_UNIQ_PUSH_KEY)
+
+public fun Intent.getMindboxUniqPushButtonKeyFromPushIntent(): String? = this.getStringExtra(EXTRA_UNIQ_PUSH_BUTTON_KEY)
+
+internal inline fun <reified T> Gson.toJsonTyped(src: T): String =
+    toJson(src, object : TypeToken<T>() {}.type)
+
+internal inline fun <reified T> Gson.fromJsonTyped(json: String): T? =
+    fromJson(json, object : TypeToken<T>() {}.type)
+
+internal fun List<InApp>.sortByPriority(): List<InApp> {
+    return this.sortedByDescending { it.isPriority }
+}
+
+internal fun InApp.firstOverlayVariant(): InAppType? =
+    form.variants.firstOrNull { variant -> variant !is InAppType.Embedded }
+
+internal fun InApp.countsShows(): Boolean = frequency.countsShows()
+
+internal fun Frequency.countsShows(): Boolean = delay !is Frequency.Delay.Unlimited
+
+internal fun <T> newConcurrentSet(): MutableSet<T> =
+    Collections.newSetFromMap(ConcurrentHashMap())
+
+/**
+ * Tags to attach to operations emitted by this in-app: [InApp.tags] when non-empty and the tags
+ * feature is enabled, otherwise `null` (so Gson omits the `tags` key downstream). The feature-flag
+ * decision is taken by the caller and passed in as [isTagsFeatureEnabled].
+ */
+internal fun InApp.gatedTags(isTagsFeatureEnabled: Boolean): Map<String, String>? =
+    tags.gatedTags(isTagsFeatureEnabled)
+
+internal fun Map<String, String>?.gatedTags(isTagsFeatureEnabled: Boolean): Map<String, String>? =
+    this?.takeIf { it.isNotEmpty() && isTagsFeatureEnabled }
+
+internal inline fun <T> Queue<T>.pollIf(predicate: (T) -> Boolean): T? {
+    return peek()?.takeIf(predicate)?.let { poll() }
+}
+
+internal fun InAppType.getImageUrl(): String? {
+    return when (this) {
+        is InAppType.WebView -> this.layers
+        is InAppType.ModalWindow -> this.layers
+        is InAppType.Snackbar -> this.layers
+        is InAppType.Embedded -> this.layers
+    }
+        .filterIsInstance<Layer.ImageLayer>()
+        .firstOrNull()
+        ?.source
+        ?.let { source ->
+            when (source) {
+                is Layer.ImageLayer.Source.UrlSource -> source.url
+            }
+        }
+}

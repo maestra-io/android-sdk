@@ -1,0 +1,281 @@
+package cloud.mindbox.mobile_sdk.inapp.presentation.view
+
+import android.content.Context
+import android.graphics.drawable.Drawable
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
+import android.widget.FrameLayout
+import android.widget.ImageView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.isVisible
+import cloud.mindbox.mobile_sdk.R
+import cloud.mindbox.mobile_sdk.di.mindboxInject
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.sendPresentationFailure
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppFailureTracker
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppType
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppTypeWrapper
+import cloud.mindbox.mobile_sdk.inapp.domain.models.Layer
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppCallback
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppMessageViewDisplayerImpl
+import cloud.mindbox.mobile_sdk.inapp.presentation.MindboxView
+import cloud.mindbox.mobile_sdk.inapp.presentation.actions.InAppActionHandler
+import cloud.mindbox.mobile_sdk.logger.mindboxLogI
+import cloud.mindbox.mobile_sdk.maxScreenDimension
+import cloud.mindbox.mobile_sdk.removeChildById
+import cloud.mindbox.mobile_sdk.safeAs
+import cloud.mindbox.mobile_sdk.setSingleClickListener
+import com.bumptech.glide.Glide
+import com.bumptech.glide.load.DataSource
+import com.bumptech.glide.load.engine.DiskCacheStrategy
+import com.bumptech.glide.load.engine.GlideException
+import com.bumptech.glide.request.RequestListener
+import com.bumptech.glide.request.target.Target
+
+internal abstract class AbstractInAppViewHolder<T : InAppType>(
+    final override val wrapper: InAppTypeWrapper<T>,
+    final override val inAppController: InAppViewHolder.InAppController,
+    final override val inAppCallback: InAppCallback,
+) : InAppViewHolder<T> {
+
+    protected open var isInAppMessageActive = false
+    override val isActive: Boolean
+        get() = isInAppMessageActive
+
+    private var positionController: InAppPositionController? = null
+
+    private var _currentDialog: FrameLayout? = null
+    protected val currentDialog: FrameLayout
+        get() = _currentDialog!!
+
+    protected val inAppLayout: InAppConstraintLayout by lazy {
+        currentDialog.findViewById(R.id.inapp_layout)!!
+    }
+
+    private var typingView: View? = null
+    private var shouldRestoreKeyboard: Boolean = false
+
+    protected val preparedImages: MutableMap<ImageView, Boolean> = mutableMapOf()
+
+    internal val inAppFailureTracker: InAppFailureTracker by mindboxInject { inAppFailureTracker }
+
+    private var inAppActionHandler = InAppActionHandler()
+    private var backRegistration: BackRegistration? = null
+
+    private fun isKeyboardVisible(root: View): Boolean =
+        ViewCompat.getRootWindowInsets(root)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+
+    protected fun hideKeyboard(currentRoot: ViewGroup) {
+        typingView = currentRoot.rootView.findFocus()
+        if (isKeyboardVisible(currentRoot)) {
+            shouldRestoreKeyboard = true
+            val context = currentRoot.context
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager?
+            imm?.hideSoftInputFromWindow(
+                currentRoot.windowToken,
+                0
+            )
+        }
+    }
+
+    protected open fun onBeforeShow(currentRoot: MindboxView) {
+        hideKeyboard(currentRoot.container)
+    }
+
+    abstract fun bind()
+
+    protected open fun addUrlSource(layer: Layer.ImageLayer, inAppCallback: InAppCallback) {
+        if (InAppMessageViewDisplayerImpl.isActionExecuted) return
+        var redirectUrl: String
+        var payload: String
+        var shouldDismiss: Boolean
+
+        inAppLayout.setSingleClickListener {
+            val inAppData = inAppActionHandler.handle(
+                layer.action,
+                inAppActionHandler.mindboxView
+            )
+
+            with(inAppData) {
+                redirectUrl = this.redirectUrl
+                payload = this.payload
+                shouldDismiss = this.shouldDismiss
+            }
+
+            wrapper.inAppActionCallbacks.onInAppClick.onClick()
+            inAppCallback.onInAppClick(
+                wrapper.inAppType.inAppId,
+                redirectUrl,
+                payload
+            )
+
+            if (shouldDismiss) {
+                inAppCallback.onInAppDismissed(wrapper.inAppType.inAppId)
+                mindboxLogI("In-app dismissed by click")
+                inAppController.close()
+            }
+
+            inAppData.onCompleted?.invoke()
+
+            InAppMessageViewDisplayerImpl.isActionExecuted = true
+        }
+    }
+
+    protected fun getImageFromCache(url: String, imageView: InAppImageView) {
+        val maxDim = currentDialog.context.maxScreenDimension()
+        val timeout = currentDialog.context.getString(R.string.mindbox_inapp_fetching_timeout).toInt()
+        Glide
+            .with(currentDialog.context)
+            .load(url)
+            .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
+            .override(maxDim, maxDim)
+            .timeout(timeout)
+            .centerInside()
+            .listener(buildCacheRequestListener(url, imageView))
+            .into(imageView)
+    }
+
+    private fun buildCacheRequestListener(
+        url: String,
+        imageView: InAppImageView,
+    ): RequestListener<Drawable> = object : RequestListener<Drawable> {
+
+        override fun onLoadFailed(
+            e: GlideException?,
+            model: Any?,
+            target: Target<Drawable>?,
+            isFirstResource: Boolean,
+        ): Boolean {
+            runCatching {
+                inAppFailureTracker.sendPresentationFailure(
+                    inAppId = wrapper.inAppType.inAppId,
+                    errorDescription = "Failed to load in-app image with url = $url",
+                    throwable = e,
+                    tags = wrapper.tags
+                )
+                inAppController.close()
+            }.onFailure { throwable ->
+                inAppFailureTracker.sendPresentationFailure(
+                    inAppId = wrapper.inAppType.inAppId,
+                    errorDescription = "Unknown error in onLoadFailed callback for url = $url",
+                    throwable = throwable,
+                    tags = wrapper.tags
+                )
+            }
+            return false
+        }
+
+        override fun onResourceReady(
+            resource: Drawable?,
+            model: Any?,
+            target: Target<Drawable>?,
+            dataSource: DataSource?,
+            isFirstResource: Boolean,
+        ): Boolean {
+            runCatching {
+                bind()
+                preparedImages[imageView] = true
+                if (!preparedImages.values.contains(false)) {
+                    this@AbstractInAppViewHolder.mindboxLogI("In-app ${wrapper.inAppType.inAppId} shown")
+                    wrapper.inAppActionCallbacks.onInAppShown.onShown()
+                    preparedImages.keys.forEach { it.isVisible = true }
+                }
+            }.onFailure { throwable ->
+                inAppFailureTracker.sendPresentationFailure(
+                    inAppId = wrapper.inAppType.inAppId,
+                    errorDescription = "Unknown error in onResourceReady callback for url = $url",
+                    throwable = throwable,
+                    tags = wrapper.tags
+                )
+            }
+            return false
+        }
+    }
+
+    protected open fun initView(currentRoot: ViewGroup) {
+        currentRoot.removeChildById(R.id.inapp_layout_container)
+        _currentDialog = LayoutInflater.from(currentRoot.context)
+            .inflate(R.layout.mindbox_inapp_layout, currentRoot, false) as FrameLayout
+        currentRoot.addView(currentDialog)
+        inAppLayout.prepareLayoutForInApp(wrapper.inAppType)
+    }
+
+    protected fun bindBackAction(currentRoot: MindboxView, onBackPress: () -> Unit) {
+        clearBackRegistration()
+        backRegistration = currentRoot.backPressRegistrar.register(inAppLayout, onBackPress)
+    }
+
+    protected fun clearBackRegistration() {
+        backRegistration?.unregister()
+        backRegistration = null
+    }
+
+    private fun attachToRoot(currentRoot: ViewGroup) {
+        if (_currentDialog == null) {
+            initView(currentRoot)
+            return
+        }
+        currentRoot.removeChildById(R.id.inapp_layout_container)
+        _currentDialog?.parent.safeAs<ViewGroup>()?.removeView(_currentDialog)
+        currentRoot.addView(currentDialog)
+    }
+
+    private fun startPositionController(currentRoot: ViewGroup) {
+        positionController?.stop()
+        positionController = null
+        val isRepositioningEnabled = currentRoot.context.resources.getBoolean(R.bool.mindbox_support_inapp_on_fragment)
+        positionController = isRepositioningEnabled.takeIf { it }?.run {
+            InAppPositionController().apply { start(currentDialog) }
+        }
+    }
+
+    protected fun restoreKeyboard() {
+        val view: View = typingView ?: return
+        val shouldShowKeyboard: Boolean = shouldRestoreKeyboard
+        typingView = null
+        shouldRestoreKeyboard = false
+        view.post {
+            view.requestFocus()
+            if (shouldShowKeyboard) {
+                val imm =
+                    (view.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager?)
+                imm?.showSoftInput(
+                    view,
+                    InputMethodManager.SHOW_IMPLICIT
+                )
+            }
+        }
+    }
+
+    override fun show(currentRoot: MindboxView) {
+        isInAppMessageActive = true
+        attachToRoot(currentRoot.container)
+        startPositionController(currentRoot.container)
+        onBeforeShow(currentRoot)
+        inAppActionHandler.mindboxView = currentRoot
+    }
+
+    override fun reattach(currentRoot: MindboxView) {
+        isInAppMessageActive = true
+        attachToRoot(currentRoot.container)
+        startPositionController(currentRoot.container)
+        hideKeyboard(currentRoot.container)
+        inAppActionHandler.mindboxView = currentRoot
+    }
+
+    override fun onClose() {
+        clearBackRegistration()
+        positionController?.stop()
+        positionController = null
+        preparedImages.keys.forEach { imageView -> runCatching { Glide.with(imageView).clear(imageView) } }
+        _currentDialog?.let { dialog -> dialog.parent.safeAs<ViewGroup>()?.removeView(dialog) }
+        mindboxLogI("Close ${wrapper.inAppType.inAppId} on ${this.hashCode()}")
+        restoreKeyboard()
+    }
+
+    override fun onStop() {
+        onClose()
+    }
+}

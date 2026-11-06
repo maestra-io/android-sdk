@@ -1,0 +1,41 @@
+apply from: "../modulesCommon.gradle"
+
+android {
+    namespace 'cloud.mindbox.mindbox_firebase'
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    defaultConfig {
+        consumerProguardFiles "consumer-rules.pro",
+                "../proguard/proguard-gson.pro",
+                "../proguard/proguard-firebase.pro",
+                "../proguard/proguard-kotlin.pro"
+    }
+}
+
+dependencies {
+    implementation project(path: ':sdk')
+
+    // Implementation dependencies
+    implementation(platform(libs.kotlinx.coroutines.bom))
+    implementation libs.androidx.core.ktx
+    implementation libs.kotlinx.coroutines.core
+
+    // GSON
+    implementation libs.gson
+
+    // Firebase messaging
+    implementation platform(libs.firebase.bom)
+    implementation libs.firebase.messaging
+    implementation libs.gms.play.services.base
+    implementation libs.gms.play.services.basement
+
+    // Ads
+    implementation libs.gms.play.services.ads.identifier
+
+    // Test dependencies
+    testImplementation libs.bundles.test
+
+}

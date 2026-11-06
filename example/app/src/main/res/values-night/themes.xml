@@ -1,0 +1,36 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Base.Theme.MaestraAndroidSdkExample" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Status bar: dark background, white icons -->
+        <item name="android:statusBarColor">@color/maestra_dark_background</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="23">false</item>
+
+        <!-- Primary — Maestra lime on dark for good contrast -->
+        <item name="colorPrimary">@color/maestra_lime</item>
+        <item name="colorOnPrimary">@color/maestra_ink</item>
+        <item name="colorPrimaryContainer">@color/maestra_green_deep</item>
+        <item name="colorOnPrimaryContainer">@color/maestra_lime_soft</item>
+
+        <!-- Secondary -->
+        <item name="colorSecondary">@color/maestra_green</item>
+        <item name="colorOnSecondary">@color/maestra_dark_background</item>
+        <item name="colorSecondaryContainer">@color/maestra_green_deep</item>
+        <item name="colorOnSecondaryContainer">@color/maestra_lime_soft</item>
+
+        <!-- Tertiary -->
+        <item name="colorTertiary">@color/maestra_lime</item>
+        <item name="colorOnTertiary">@color/maestra_dark_background</item>
+
+        <!-- Surfaces -->
+        <item name="android:colorBackground">@color/maestra_dark_background</item>
+        <item name="colorSurface">@color/maestra_dark_surface</item>
+        <item name="colorOnSurface">@color/maestra_dark_on_surface</item>
+        <item name="colorSurfaceVariant">@color/maestra_dark_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/maestra_text_secondary</item>
+
+        <!-- Outline -->
+        <item name="colorOutline">@color/maestra_dark_outline</item>
+        <item name="colorOutlineVariant">@color/maestra_dark_surface_variant</item>
+    </style>
+
+    <style name="Theme.MaestraAndroidSdkExample" parent="Base.Theme.MaestraAndroidSdkExample" />
+</resources>

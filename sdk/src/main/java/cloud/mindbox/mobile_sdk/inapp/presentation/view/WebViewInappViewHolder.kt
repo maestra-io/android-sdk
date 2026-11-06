@@ -1,0 +1,809 @@
+package cloud.mindbox.mobile_sdk.inapp.presentation.view
+
+import android.app.Activity
+import android.app.Application
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.view.ViewGroup
+import android.widget.RelativeLayout
+import androidx.core.net.toUri
+import cloud.mindbox.mobile_sdk.*
+import cloud.mindbox.mobile_sdk.annotations.InternalMindboxApi
+import cloud.mindbox.mobile_sdk.di.mindboxInject
+import cloud.mindbox.mobile_sdk.inapp.data.dto.BackgroundDto
+import cloud.mindbox.mobile_sdk.inapp.data.managers.SessionStorageManager
+import cloud.mindbox.mobile_sdk.inapp.data.validators.BridgeMessageValidator
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.executeWithFailureTracking
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.sendFailureWithContext
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.PermissionManager
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppType
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppTypeWrapper
+import cloud.mindbox.mobile_sdk.inapp.domain.models.Layer
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppCallback
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewCachePolicy
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewPrewarmManager
+import cloud.mindbox.mobile_sdk.inapp.presentation.MindboxView
+import cloud.mindbox.mobile_sdk.utils.Constants
+import cloud.mindbox.mobile_sdk.utils.TimeProvider
+import cloud.mindbox.mobile_sdk.inapp.webview.*
+import cloud.mindbox.mobile_sdk.logger.mindboxLogD
+import cloud.mindbox.mobile_sdk.logger.mindboxLogE
+import cloud.mindbox.mobile_sdk.logger.mindboxLogI
+import cloud.mindbox.mobile_sdk.logger.mindboxLogW
+import cloud.mindbox.mobile_sdk.managers.DbManager
+import cloud.mindbox.mobile_sdk.managers.GatewayManager
+import cloud.mindbox.mobile_sdk.models.Configuration
+import cloud.mindbox.mobile_sdk.models.InAppEventType
+import cloud.mindbox.mobile_sdk.models.getShortUserAgent
+import cloud.mindbox.mobile_sdk.models.operation.request.FailureReason
+import cloud.mindbox.mobile_sdk.utils.MindboxUtils.Stopwatch
+import cloud.mindbox.mobile_sdk.utils.loggingRunCatchingSuspending
+import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.DurationUnit
+
+@OptIn(InternalMindboxApi::class)
+internal class WebViewInAppViewHolder(
+    wrapper: InAppTypeWrapper<InAppType.WebView>,
+    controller: InAppViewHolder.InAppController,
+    inAppCallback: InAppCallback,
+) : AbstractInAppViewHolder<InAppType.WebView>(wrapper, controller, inAppCallback), MindboxWebPage {
+
+    companion object {
+        internal fun initTimeoutDescription(readyCheckFailure: String?): String {
+            val seconds = Constants.WebView.readyTimeout.interval / 1_000
+            return if (readyCheckFailure != null) {
+                "JS bridge not found on the loaded page within ${seconds}s: $readyCheckFailure."
+            } else {
+                "Page did not send init within ${seconds}s."
+            }
+        }
+
+        private const val TIMER = "CLOSE_INAPP_TIMER"
+        private const val JS_RETURN = "true"
+        private const val JS_BRIDGE_CLASS = "window.bridgeMessagesHandlers"
+        private const val JS_BRIDGE = "$JS_BRIDGE_CLASS.emit"
+        private const val JS_CALL_BRIDGE = "(()=>{try{$JS_BRIDGE(%s);return!0}catch(_){return!1}})()"
+        private const val JS_NATIVE_BRIDGE_CLASS = "window.$DEFAULT_WEBVIEW_BRIDGE_NAME"
+        private const val JS_NATIVE_BRIDGE = "$JS_NATIVE_BRIDGE_CLASS.postMessage"
+        private const val BRIDGE_STATUS_READY = "ok"
+        private const val BRIDGE_STATUS_NO_NATIVE_BRIDGE = "no-native-bridge"
+        private const val BRIDGE_STATUS_NO_HANDLERS = "no-handlers"
+
+        // Returns a status, not a boolean: the give-up message carries it into errorDetails, so a
+        // native bridge stripped by R8 is told apart from page JS that never booted.
+        private const val JS_CHECK_BRIDGE = "(() => {" +
+            "if (typeof $JS_NATIVE_BRIDGE_CLASS === 'undefined' || " +
+            "typeof $JS_NATIVE_BRIDGE !== 'function') return '$BRIDGE_STATUS_NO_NATIVE_BRIDGE';" +
+            "if (typeof $JS_BRIDGE_CLASS === 'undefined' || typeof $JS_BRIDGE !== 'function') return '$BRIDGE_STATUS_NO_HANDLERS';" +
+            "return '$BRIDGE_STATUS_READY';" +
+            "})()"
+
+        // evaluateJavascript hands back the JSON encoding of the result, so a string arrives quoted.
+        private const val JS_BRIDGE_READY = "\"$BRIDGE_STATUS_READY\""
+    }
+
+    private var webViewController: WebViewController? = null
+    private val mainHandler: Handler = Handler(Looper.getMainLooper())
+    private val pageScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + Mindbox.coroutineExceptionHandler)
+
+    @Volatile private var isClosed = false
+
+    private var currentWebViewOrigin: String? = null
+    private var readyChecker: WebViewReadyChecker? = null
+    private var hasInitialized = false
+    private var hasShownFired = false
+    private var pendingReadyCheckFailure: String? = null
+    private var lastLoadedContent: WebViewHtmlContent? = null
+    private var initTimeout: Runnable? = null
+
+    private val noCacheRetryPolicy: WebViewNoCacheRetryPolicy = WebViewNoCacheRetryPolicy {
+        webViewCachePolicy.isCacheEnabled
+    }
+
+    private fun bindWebViewBackAction(currentRoot: MindboxView, controller: WebViewController) {
+        bindBackAction(currentRoot) { sendBackAction(controller) }
+    }
+
+    private val pendingResponsesById: MutableMap<String, CompletableDeferred<BridgeMessage.Response>> =
+        ConcurrentHashMap()
+
+    private val gson: Gson by mindboxInject { this.gson }
+    private val timeProvider: TimeProvider by mindboxInject { timeProvider }
+    private val webViewPrewarmManager: InAppWebViewPrewarmManager by mindboxInject { inAppWebViewPrewarmManager }
+    private val webViewCachePolicy: InAppWebViewCachePolicy by mindboxInject { webViewCachePolicy }
+    private val messageValidator: BridgeMessageValidator by lazy { BridgeMessageValidator() }
+    private val gatewayManager: GatewayManager by mindboxInject { gatewayManager }
+    private val sessionStorageManager: SessionStorageManager by mindboxInject { sessionStorageManager }
+    private val permissionManager: PermissionManager by mindboxInject { permissionManager }
+    private val appContext: Application by mindboxInject { appContext }
+    private val webPageRegistry: MindboxWebPageRegistry by mindboxInject { webPageRegistry }
+
+    private val commonBridgeActionsLazy = lazy {
+        WebViewCommonBridgeActions(object : WebViewBridgeHost {
+            override val hostActivity: Activity? get() = webViewController?.view?.context?.findActivity()
+            override val hostTags: Map<String, String>? get() = wrapper.tags
+            override val hostPage: MindboxWebPage get() = this@WebViewInAppViewHolder
+            override val hostInAppId: String get() = wrapper.inAppType.inAppId
+            override val isRequesterActive: Boolean get() = !isClosed
+
+            override fun sendToPage(message: BridgeMessage.Request, onError: (String?) -> Unit) {
+                val controller = webViewController ?: return
+                sendActionInternal(controller, message, onError = onError)
+            }
+
+            override val closeCapability: ((BridgeMessage.Request) -> String) = ::handleCloseAction
+            override val hideCapability: (() -> String) = ::handleHideAction
+
+            override fun requireCanShowInApp() = Unit
+        })
+    }
+    private val commonBridgeActions: WebViewCommonBridgeActions by commonBridgeActionsLazy
+
+    @Volatile private var isRegisteredForBroadcasts = false
+
+    private var currentMindboxView: MindboxView? = null
+
+    override fun onBeforeShow(currentRoot: MindboxView) = Unit
+
+    override fun bind() {}
+
+    suspend fun sendActionAndAwaitResponse(
+        controller: WebViewController,
+        message: BridgeMessage.Request
+    ): BridgeMessage.Response {
+        val responseDeferred: CompletableDeferred<BridgeMessage.Response> = CompletableDeferred()
+        pendingResponsesById[message.id] = responseDeferred
+        sendActionInternal(controller = controller, message = message) { error ->
+            if (responseDeferred.isActive) {
+                responseDeferred.completeExceptionally(
+                    IllegalStateException("Failed to send message ${message.action} to WebView: $error")
+                )
+            }
+        }
+        return try {
+            responseDeferred.await()
+        } finally {
+            pendingResponsesById.remove(message.id)
+        }
+    }
+
+    override fun push(action: WebViewAction, payload: String) {
+        val controller = webViewController ?: return
+        Mindbox.mindboxScope.launch {
+            loggingRunCatchingSuspending {
+                val response = withTimeoutOrNull(Constants.WebView.readyTimeout.interval) {
+                    sendActionAndAwaitResponse(controller, BridgeMessage.createAction(action, payload))
+                }
+                mindboxLogI(
+                    "[WebView] push '$action' " +
+                        (if (response != null) "confirmed" else "was not confirmed") + " by the page"
+                )
+            }
+        }
+    }
+
+    private fun registerForBroadcasts() {
+        if (isRegisteredForBroadcasts) return
+        isRegisteredForBroadcasts = true
+        webPageRegistry.register(this)
+    }
+
+    private fun unregisterFromBroadcasts() {
+        if (!isRegisteredForBroadcasts) return
+        isRegisteredForBroadcasts = false
+        webPageRegistry.unregister(this)
+    }
+
+    private fun sendActionInternal(
+        controller: WebViewController,
+        message: BridgeMessage,
+        sentAction: String? = null,
+        onError: ((String?) -> Unit)? = null
+    ) {
+        mindboxLogI("SDK -> send message $message")
+        val json: String = gson.toBridgeJson(message, sentAction)
+        val escapedJson: String = JSONObject.quote(json)
+        controller.evaluateJavaScript(JS_CALL_BRIDGE.format(escapedJson)) { result ->
+            if (!checkEvaluateJavaScript(message, result)) {
+                onError?.invoke(result)
+            }
+        }
+    }
+
+    private fun createWebViewActionHandlers(
+        controller: WebViewController,
+        layer: Layer.WebViewLayer,
+        configuration: Configuration
+    ): WebViewActionHandlers {
+        return WebViewActionHandlers().apply {
+            commonBridgeActions.register(this)
+            register(WebViewAction.CLICK, ::handleClickAction)
+            register(WebViewAction.READY) {
+                handleReadyAction(
+                    configuration = configuration,
+                    insets = inAppLayout.webViewInsets,
+                    params = layer.params,
+                    inAppId = wrapper.inAppType.inAppId,
+                )
+            }
+            register(WebViewAction.INIT) {
+                handleInitAction(controller)
+            }
+        }
+    }
+
+    private fun handleReadyAction(
+        configuration: Configuration,
+        insets: InAppInsets,
+        params: Map<String, String>,
+        inAppId: String,
+    ): String {
+        registerForBroadcasts()
+        return DataCollector(
+            appContext = appContext,
+            sessionStorageManager = sessionStorageManager,
+            permissionManager = permissionManager,
+            gson = gson,
+            configuration = configuration,
+            params = DataCollector.mergedParams(config = params, fromCaller = wrapper.extraParams),
+            inAppInsets = insets,
+            inAppId = inAppId,
+            operation = if (wrapper.isRequestedShow) {
+                null
+            } else {
+                sessionStorageManager.state.inAppTriggerEvent as? InAppEventType.OrdinalEvent
+            },
+        ).get()
+    }
+
+    private fun activateFirstShowPresentation(
+        mindboxView: MindboxView,
+        controller: WebViewController,
+    ) {
+        hideKeyboard(inAppLayout)
+        inAppLayout.requestFocus()
+        bindWebViewBackAction(mindboxView, controller)
+        controller.setVisibility(true)
+    }
+
+    private fun handleInitAction(controller: WebViewController): String {
+        val mindboxView = checkNotNull(currentMindboxView) { "MindboxView is null when activating WebView In-App" }
+        hasInitialized = true
+        stopTimer()?.let { waited -> mindboxLogI("[WebView] In-app ${wrapper.inAppType.inAppId}: init received after $waited") }
+        if (noCacheRetryPolicy.hasRetried) {
+            controller.setCacheBypass(false)
+        }
+        lastLoadedContent = null
+        if (!hasShownFired) {
+            hasShownFired = true
+            wrapper.inAppActionCallbacks.onInAppShown.onShown()
+        }
+        activateFirstShowPresentation(
+            mindboxView = mindboxView,
+            controller = controller,
+        )
+        return BridgeMessage.SUCCESS_PAYLOAD
+    }
+
+    private fun handleClickAction(message: BridgeMessage.Request): String {
+        runCatching {
+            val actionDto: BackgroundDto.LayerDto.ImageLayerDto.ActionDto =
+                gson.fromJson<BackgroundDto.LayerDto.ImageLayerDto.ActionDto>(message.payload).getOrThrow()
+            val actionResult: Pair<String?, String?> = when (actionDto) {
+                is BackgroundDto.LayerDto.ImageLayerDto.ActionDto.RedirectUrlActionDto ->
+                    actionDto.value to actionDto.intentPayload
+
+                is BackgroundDto.LayerDto.ImageLayerDto.ActionDto.PushPermissionActionDto ->
+                    "" to actionDto.intentPayload
+            }
+            val url: String? = actionResult.first
+            val payload: String? = actionResult.second
+            inAppCallback.onInAppClick(
+                wrapper.inAppType.inAppId,
+                url ?: "",
+                payload ?: ""
+            )
+        }
+        mindboxLogI("In-app completed by webview action with data: ${message.payload}")
+        return BridgeMessage.SUCCESS_PAYLOAD
+    }
+
+    private fun handleCloseAction(message: BridgeMessage): String {
+        inAppCallback.onInAppDismissed(wrapper.inAppType.inAppId)
+        mindboxLogI("In-app dismissed by webview action ${message.action} with payload ${message.payload}")
+        inAppController.close()
+        return BridgeMessage.SUCCESS_PAYLOAD
+    }
+
+    private fun handleHideAction(): String {
+        webViewController?.setVisibility(false)
+        return BridgeMessage.SUCCESS_PAYLOAD
+    }
+
+    private fun createWebViewController(layer: Layer.WebViewLayer): WebViewController {
+        mindboxLogI("Creating WebView for In-App: ${wrapper.inAppType.inAppId} with layer ${layer.type}")
+        val controller: WebViewController = WebViewController.create(
+            context = currentDialog.context,
+            isDebugEnabled = BuildConfig.DEBUG,
+            isCacheEnabled = webViewCachePolicy.isCacheEnabled,
+            log = { message -> mindboxLogI("[WebView] $message") }
+        )
+        val view: WebViewPlatformView = controller.view
+        view.layoutParams = RelativeLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        controller.setEventListener(object : WebViewEventListener {
+            override fun onPageFinished(url: String?) {
+                mindboxLogD("onPageFinished: $url")
+                currentWebViewOrigin = resolveOrigin(url) ?: currentWebViewOrigin
+                startReadyCheck(url)
+            }
+
+            override fun onShouldOverrideUrlLoading(url: String?, isForMainFrame: Boolean?): Boolean {
+                return handleShouldOverrideUrlLoading(url = url, isForMainFrame = isForMainFrame)
+            }
+
+            override fun onError(error: WebViewError) {
+                mindboxLogE("WebView error: code=${error.code}, description=${error.description}, url=${error.url}")
+                if (error.isForMainFrame == true) {
+                    inAppFailureTracker.sendFailureWithContext(
+                        inAppId = wrapper.inAppType.inAppId,
+                        failureReason = FailureReason.WEBVIEW_PRESENTATION_FAILED,
+                        errorDescription = "Page failed to load: ${error.code} ${error.description}",
+                        tags = wrapper.tags
+                    )
+                    inAppController.close()
+                }
+            }
+
+            override fun onHttpError(url: String?, statusCode: Int?, isForMainFrame: Boolean?) {
+                if (isRecoverableScriptHttpError(url, statusCode)) {
+                    mindboxLogW("[WebView] HTTP error $statusCode for $url (mainFrame=$isForMainFrame)")
+                } else {
+                    mindboxLogI("[WebView] HTTP error $statusCode for $url (mainFrame=$isForMainFrame)")
+                }
+                if (noCacheRetryPolicy.onHttpError(url, statusCode, hasInitialized)) {
+                    retryContentPageWithoutCache()
+                }
+            }
+        })
+        return controller
+    }
+
+    private fun retryContentPageWithoutCache() {
+        val controller = webViewController ?: return
+        val content = lastLoadedContent ?: return
+        mindboxLogI("[WebView] Retrying In-App content load with cache bypassed (${noCacheRetryPolicy.lastHttpErrorDetail})")
+        // stop timer when retry
+        initTimeout?.let(mainHandler::removeCallbacks)
+        initTimeout = null
+        Stopwatch.stop(TIMER)
+        readyChecker?.cancel()
+        controller.setCacheBypass(true)
+        onContentPageLoaded(content)
+    }
+
+    private fun handleShouldOverrideUrlLoading(url: String?, isForMainFrame: Boolean?): Boolean {
+        if (isForMainFrame != true) {
+            return false
+        }
+        if (shouldAllowLocalNavigation(url)) {
+            return false
+        }
+        val normalizedUrl: String = url?.trim().orEmpty()
+        sendNavigationInterceptedEvent(url = normalizedUrl)
+        return true
+    }
+
+    private fun sendNavigationInterceptedEvent(url: String) {
+        val controller: WebViewController = webViewController ?: return
+        val payload: String = gson.toJson(NavigationInterceptedPayload(url = url))
+        val message: BridgeMessage.Request = BridgeMessage.createAction(
+            action = WebViewAction.NAVIGATION_INTERCEPTED,
+            payload = payload
+        )
+        sendActionInternal(controller, message) { error ->
+            mindboxLogW("Failed to send navigationIntercepted event to WebView: $error")
+        }
+    }
+
+    private fun shouldAllowLocalNavigation(url: String?): Boolean {
+        if (url.isNullOrBlank()) {
+            return true
+        }
+        val normalizedUrl: String = url.trim()
+        if (normalizedUrl.startsWith("#")) {
+            return true
+        }
+        if (normalizedUrl.startsWith("about:blank")) {
+            return true
+        }
+        val targetOrigin: String = resolveOrigin(normalizedUrl) ?: return false
+        val sourceOrigin: String = currentWebViewOrigin ?: return false
+        return targetOrigin == sourceOrigin
+    }
+
+    private fun resolveOrigin(url: String?): String? {
+        if (url.isNullOrBlank()) {
+            return null
+        }
+        val parsedUri: Uri = runCatching { url.toUri() }.getOrNull() ?: return null
+        val scheme: String = parsedUri.scheme?.lowercase(Locale.US).orEmpty()
+        val host: String = parsedUri.host?.lowercase(Locale.US).orEmpty()
+        if (scheme.isBlank() || host.isBlank()) {
+            return null
+        }
+        val normalizedPort: String = if (parsedUri.port >= 0) ":${parsedUri.port}" else ""
+        return "$scheme://$host$normalizedPort"
+    }
+
+    private fun sendBackAction(controller: WebViewController) {
+        val message: BridgeMessage.Request = BridgeMessage.createAction(
+            WebViewAction.BACK,
+            BridgeMessage.EMPTY_PAYLOAD
+        )
+        sendActionInternal(controller, message) { error ->
+            mindboxLogW("Failed to send back action to WebView: $error")
+            inAppCallback.onInAppDismissed(wrapper.inAppType.inAppId)
+            inAppController.close()
+        }
+    }
+
+    /**
+     * Readiness probe for a freshly finished page. Module scripts can evaluate a beat after
+     * `onPageFinished` (slow device, cold cache), so a single early `false` must not close a
+     * healthy in-app — the checker polls before giving up. Every new `onPageFinished` (redirect,
+     * re-load) restarts the poll; teardown cancels it. The outgoing-message verification in
+     * [sendActionInternal] intentionally stays single-shot ([checkEvaluateJavaScript]) — that
+     * path talks to a page that already proved itself ready.
+     *
+     * Give-up BEFORE `init` only records the failure ([pendingReadyCheckFailure]) — the
+     * init timer is the closing authority there, since the checker's ~1.2s budget can
+     * expire while an allowed same-origin navigation is still in flight or a slow page is
+     * still booting its bridge (cases the timer would have accepted; the window stays
+     * invisible until `init` anyway). Give-up AFTER `init` closes immediately instead: a
+     * same-origin navigation broke a bridge that had already proven itself alive, and
+     * there is no init timer left to catch it.
+     */
+    private fun startReadyCheck(url: String?) {
+        // A late onPageFinished can be queued on the main looper when the in-app closes;
+        // a checker started against the torn-down holder would only produce a spurious
+        // failure event.
+        if (webViewController == null) return
+        readyChecker?.cancel()
+        val checker = WebViewReadyChecker(
+            evaluate = { script, resultCallback ->
+                webViewController?.evaluateJavaScript(script, resultCallback)
+                    ?: resultCallback(null)
+            },
+            schedule = { delayMillis, action -> mainHandler.postDelayed(action, delayMillis) }
+        )
+        readyChecker = checker
+        checker.run(
+            script = JS_CHECK_BRIDGE,
+            expectedResult = JS_BRIDGE_READY,
+            onReady = { mindboxLogD("JS ready check passed for $url") },
+            onGiveUp = { lastFailure ->
+                mindboxLogI("[WebView] JS ready check gave up for URL $url: $lastFailure")
+                if (hasInitialized) {
+                    inAppFailureTracker.sendFailureWithContext(
+                        inAppId = wrapper.inAppType.inAppId,
+                        failureReason = FailureReason.WEBVIEW_PRESENTATION_FAILED,
+                        errorDescription = "JS bridge lost after the page was shown: $lastFailure",
+                        tags = wrapper.tags
+                    )
+                    inAppController.close()
+                } else {
+                    pendingReadyCheckFailure = lastFailure
+                }
+            }
+        )
+    }
+
+    internal fun checkEvaluateJavaScript(message: BridgeMessage, response: String?): Boolean {
+        return when (response) {
+            JS_RETURN -> true
+            else -> {
+                mindboxLogW("[WebView] Bridge: '${message.action}' ${message.id} (${message.type}) did not reach the page: $response")
+                false
+            }
+        }
+    }
+
+    private fun handleRequest(
+        message: BridgeMessage.Request,
+        sentAction: String?,
+        controller: WebViewController,
+        handlers: WebViewActionHandlers,
+    ) {
+        handlers.dispatch(
+            message = message,
+            isUserPresent = true,
+            launchSuspending = { handle -> Mindbox.mindboxScope.launch { handle() } },
+            respond = { payload ->
+                sendSuccessResponse(message = message, responsePayload = payload, controller = controller)
+            },
+            refuse = { error ->
+                sendErrorResponse(message = message, sentAction = sentAction, error = error, controller = controller)
+            },
+        )
+    }
+
+    private fun sendSuccessResponse(
+        message: BridgeMessage.Request,
+        responsePayload: String?,
+        controller: WebViewController,
+    ) {
+        val responseMessage: BridgeMessage.Response = BridgeMessage.createResponseAction(message, responsePayload)
+        sendActionInternal(controller, responseMessage)
+    }
+
+    private fun sendErrorResponse(
+        message: BridgeMessage.Request,
+        sentAction: String?,
+        error: Throwable,
+        controller: WebViewController,
+    ) {
+        logBridgeRefusal(message, wrapper.inAppType.inAppId, error)
+        sendActionInternal(
+            controller = controller,
+            message = BridgeMessage.createErrorAction(message, gson.toBridgeErrorPayload(error)),
+            sentAction = sentAction,
+        )
+    }
+
+    private fun handleResponse(message: BridgeMessage.Response) {
+        val responseDeferred: CompletableDeferred<BridgeMessage.Response>? = pendingResponsesById.remove(message.id)
+        if (responseDeferred == null) {
+            mindboxLogW("No pending response for id ${message.id}")
+            return
+        }
+        if (!responseDeferred.isCompleted) {
+            responseDeferred.complete(message)
+        }
+    }
+
+    private fun handleError(message: BridgeMessage.Error) {
+        mindboxLogW("WebView error: ${message.payload}")
+        val responseDeferred: CompletableDeferred<BridgeMessage.Response>? = pendingResponsesById.remove(message.id)
+        responseDeferred?.cancel("WebView error: ${message.payload}")
+        handleCloseAction(message)
+    }
+
+    private fun cancelPendingResponses(reason: String) {
+        val error: CancellationException = CancellationException(reason)
+        pendingResponsesById.values.forEach { deferred ->
+            if (!deferred.isCompleted) {
+                deferred.cancel(error)
+            }
+        }
+        pendingResponsesById.clear()
+    }
+
+    private fun renderLayer(layer: Layer.WebViewLayer) {
+        if (webViewController == null) {
+            // A real show takes priority: kill the prewarm so it can't compete for bandwidth.
+            webViewPrewarmManager.onRealShowWillStart()
+            val controller: WebViewController = createWebViewController(layer)
+            webViewController = controller
+
+            pageScope.launch {
+                val configuration: Configuration = DbManager.listenConfigurations().first()
+                val handlers: WebViewActionHandlers = createWebViewActionHandlers(controller, layer, configuration)
+
+                controller.setVisibility(false)
+                controller.setJsBridge(bridge = { json ->
+                    mindboxLogI("SDK <- receive message $json")
+                    val (message, sentAction) = gson.fromBridgeMessage(json) ?: return@setJsBridge
+                    if (!messageValidator.isValid(message)) {
+                        return@setJsBridge
+                    }
+
+                    controller.executeOnViewThread {
+                        if (webViewController !== controller) {
+                            mindboxLogW("Dropping a page message that reached WebView In-App ${wrapper.inAppType.inAppId} after it was closed")
+                            return@executeOnViewThread
+                        }
+                        when (message) {
+                            is BridgeMessage.Request -> handleRequest(message, sentAction, controller, handlers)
+                            is BridgeMessage.Response -> handleResponse(message)
+                            is BridgeMessage.Error -> handleError(message)
+                        }
+                    }
+                })
+
+                controller.setUserAgentSuffix(configuration.getShortUserAgent())
+
+                layer.contentUrl?.let { contentUrl ->
+                    runCatching {
+                        gatewayManager.fetchWebViewContent(contentUrl)
+                    }.onSuccess { response: String ->
+                        controller.executeOnViewThread {
+                            if (isClosed) return@executeOnViewThread
+                            currentWebViewOrigin = resolveOrigin(layer.baseUrl)
+                            onContentPageLoaded(
+                                content = WebViewHtmlContent(
+                                    baseUrl = layer.baseUrl ?: "",
+                                    html = response
+                                )
+                            )
+                        }
+                    }.onFailure { e ->
+                        if (e is CancellationException) throw e
+                        controller.executeOnViewThread {
+                            if (isClosed) {
+                                mindboxLogI("Content of In-App ${wrapper.inAppType.inAppId} failed to load after it closed, not reporting it")
+                                return@executeOnViewThread
+                            }
+                            inAppFailureTracker.sendFailureWithContext(
+                                inAppId = wrapper.inAppType.inAppId,
+                                failureReason = FailureReason.WEBVIEW_LOAD_FAILED,
+                                errorDescription = "Failed to fetch page HTML",
+                                throwable = e,
+                                tags = wrapper.tags
+                            )
+                            inAppController.close()
+                        }
+                    }
+                } ?: controller.executeOnViewThread {
+                    if (isClosed) return@executeOnViewThread
+                    inAppFailureTracker.sendFailureWithContext(
+                        inAppId = wrapper.inAppType.inAppId,
+                        failureReason = FailureReason.WEBVIEW_LOAD_FAILED,
+                        errorDescription = "WebView content URL is null",
+                        tags = wrapper.tags
+                    )
+                    inAppController.close()
+                }
+            }
+        }
+
+        webViewController?.let { controller ->
+            inAppFailureTracker.executeWithFailureTracking(
+                inAppId = wrapper.inAppType.inAppId,
+                failureReason = FailureReason.PRESENTATION_FAILED,
+                errorDescription = "Error when trying WebView layout",
+                tags = wrapper.tags,
+            ) {
+                val view: WebViewPlatformView = controller.view
+                if (view.parent !== inAppLayout) {
+                    view.parent.safeAs<ViewGroup>()?.removeView(view)
+                    inAppLayout.addView(view)
+                }
+            }
+        } ?: run {
+            inAppFailureTracker.sendFailureWithContext(
+                inAppId = wrapper.inAppType.inAppId,
+                failureReason = FailureReason.WEBVIEW_PRESENTATION_FAILED,
+                errorDescription = "WebView controller is null when trying show inapp",
+                tags = wrapper.tags
+            )
+            inAppController.close()
+        }
+    }
+
+    private fun onContentPageLoaded(content: WebViewHtmlContent) {
+        webViewController?.let { controller ->
+            hasInitialized = false
+            pendingReadyCheckFailure = null
+            lastLoadedContent = content
+            controller.loadContent(content)
+            startTimer {
+                initTimeout = null
+                Stopwatch.stop(TIMER)
+                val readyCheckFailure = pendingReadyCheckFailure
+                val httpErrorSuffix = noCacheRetryPolicy.lastHttpErrorDetail?.let { detail ->
+                    " Last script HTTP error: $detail; no-cache retry attempted: ${noCacheRetryPolicy.hasRetried}."
+                }.orEmpty()
+                inAppFailureTracker.sendFailureWithContext(
+                    inAppId = wrapper.inAppType.inAppId,
+                    failureReason = if (readyCheckFailure != null) {
+                        FailureReason.WEBVIEW_PRESENTATION_FAILED
+                    } else {
+                        FailureReason.WEBVIEW_LOAD_FAILED
+                    },
+                    errorDescription = initTimeoutDescription(readyCheckFailure) + httpErrorSuffix,
+                    tags = wrapper.tags
+                )
+                inAppController.close()
+            }
+        } ?: run {
+            mindboxLogW("WebView controller is null when loading content, skipping")
+        }
+    }
+
+    private fun stopTimer(): String? {
+        val timeout = initTimeout ?: return null
+        mainHandler.removeCallbacks(timeout)
+        initTimeout = null
+        return Stopwatch.stop(TIMER)?.toString(DurationUnit.SECONDS, 2)
+    }
+
+    private fun startTimer(onTimeOut: () -> Unit) {
+        Stopwatch.start(TIMER)
+        initTimeout?.let(mainHandler::removeCallbacks)
+        val timeout = Runnable { onTimeOut() }
+        initTimeout = timeout
+        mainHandler.postDelayed(timeout, Constants.WebView.readyTimeout.interval)
+    }
+
+    override fun show(currentRoot: MindboxView) {
+        currentMindboxView = currentRoot
+        super.show(currentRoot)
+        mindboxLogI("Try to show in-app with id ${wrapper.inAppType.inAppId}")
+        wrapper.inAppType.layers.forEach { layer ->
+            when (layer) {
+                is Layer.WebViewLayer -> renderLayer(layer)
+                else -> mindboxLogW("Layer is not supported")
+            }
+        }
+        mindboxLogI("Loading In-App ${wrapper.inAppType.inAppId} in holder ${this.hashCode()}")
+    }
+
+    override fun reattach(currentRoot: MindboxView) {
+        currentMindboxView = currentRoot
+        super.reattach(currentRoot)
+        wrapper.inAppType.layers.forEach { layer ->
+            when (layer) {
+                is Layer.WebViewLayer -> renderLayer(layer)
+                else -> mindboxLogW("Layer is not supported")
+            }
+        }
+        inAppLayout.requestFocus()
+        webViewController?.let { controller -> bindWebViewBackAction(currentRoot, controller) }
+    }
+
+    override fun canReuseOnRestore(inAppId: String): Boolean = wrapper.inAppType.inAppId == inAppId
+
+    override fun onStop() {
+        // do nothing
+    }
+
+    override fun onClose() {
+        isClosed = true
+        pageScope.cancel()
+        stopTimer()?.let { waited -> mindboxLogI("[WebView] In-app ${wrapper.inAppType.inAppId}: closed before init after $waited") }
+        unregisterFromBroadcasts()
+        if (commonBridgeActionsLazy.isInitialized()) {
+            commonBridgeActions.tearDown()
+        }
+        readyChecker?.cancel()
+        readyChecker = null
+        lastLoadedContent = null
+        cancelPendingResponses("WebView In-App is closed")
+        webViewController?.let { controller ->
+            // Remember which https hosts this show actually used — feeds the next launch's preconnect.
+            webViewPrewarmManager.captureObservedHosts(controller)
+            // Detach first: a page event already queued on the main looper must not reach
+            // this torn-down holder (e.g. a late onPageFinished spawning a ready checker).
+            controller.setEventListener(null)
+            val view: WebViewPlatformView = controller.view
+            view.parent.safeAs<ViewGroup>()?.removeView(view)
+            controller.destroy()
+        }
+        currentWebViewOrigin = null
+        webViewController = null
+        currentMindboxView = null
+        super.onClose()
+    }
+
+    private data class NavigationInterceptedPayload(
+        @SerializedName("url")
+        val url: String
+    )
+}

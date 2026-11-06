@@ -1,0 +1,235 @@
+package cloud.mindbox.mobile_sdk.inapp.data.managers
+
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppSerializationManager
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppErrorsWrapper
+import cloud.mindbox.mobile_sdk.models.operation.request.FailureReason
+import cloud.mindbox.mobile_sdk.models.operation.request.InAppClickRequest
+import cloud.mindbox.mobile_sdk.models.operation.request.InAppShowRequest
+import cloud.mindbox.mobile_sdk.models.operation.request.InAppShowFailure
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import io.mockk.every
+import io.mockk.mockk
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Before
+import org.junit.Test
+
+internal class InAppSerializationManagerTest {
+
+    private val gson: Gson = Gson()
+    private lateinit var inAppSerializationManager: InAppSerializationManager
+    private val inAppId = "validInAppId"
+    private val otherInAppId = "otherInAppId"
+
+    @Before
+    fun onTestStart() {
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+    }
+
+    @Test
+    fun `deserializeToShownInAppsMap returns valid map`() {
+        val json = "{\"app1\":[100, 120],\"app2\":[200, 220]}"
+        val expectedMap = mapOf("app1" to listOf(100L, 120L), "app2" to listOf(200L, 220L))
+
+        val actualMap = inAppSerializationManager.deserializeToShownInAppsMap(json)
+        assertEquals(expectedMap, actualMap)
+    }
+
+    @Test
+    fun `deserializeToShownInAppsMap returns empty map when exception occurs`() {
+        val json = "{\"app1\":[100, 120]\"app2\":[200, 220]}"
+        val gson: Gson = mockk()
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+        // Mocking runCatching to throw an exception
+        every { gson.fromJson<String>(json, object : TypeToken<HashMap<String, List<Long>>>() {}.type) } throws RuntimeException("Some exception")
+
+        val actualMap = inAppSerializationManager.deserializeToShownInAppsMap(json)
+
+        assertEquals(emptyMap<String, Long>(), actualMap)
+    }
+
+    @Test
+    fun `serializeToShownInAppsString returns valid JSON string`() {
+        val shownInApps = mapOf("app1" to listOf(100L, 120L), "app2" to listOf(200L, 220L))
+        val expectedJson = "{\"app1\":[100,120],\"app2\":[200,220]}"
+
+        val actualJson = inAppSerializationManager.serializeToShownInAppsString(shownInApps)
+
+        assertEquals(expectedJson, actualJson)
+    }
+
+    @Test
+    fun `serializeToShownInAppsString returns empty string when exception occurs`() {
+        val gson: Gson = mockk()
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+        val shownInApps = mapOf("app1" to listOf(100L), "app2" to listOf(200L))
+        every { gson.toJson(shownInApps, object : TypeToken<HashMap<String, Long>>() {}.type) } throws RuntimeException("Some exception")
+
+        val actualJson = inAppSerializationManager.serializeToShownInAppsString(shownInApps)
+
+        assertEquals("", actualJson)
+    }
+
+    @Test
+    fun `serializeToInAppTargetingString returns JSON with inAppId only when tags null`() {
+        val expectedResult = "{\"inappId\":\"${inAppId}\"}"
+        val actualResult = inAppSerializationManager.serializeToInAppTargetingString(inAppId, tags = null)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppTargetingString returns JSON with inAppId and tags when tags present`() {
+        val expectedResult = "{\"inappId\":\"${inAppId}\",\"tags\":{\"templateType\":\"Popup\"}}"
+        val actualResult = inAppSerializationManager.serializeToInAppTargetingString(
+            inAppId,
+            tags = mapOf("templateType" to "Popup"),
+        )
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppTargetingString returns empty string on error`() {
+        val gson: Gson = mockk()
+        every { gson.toJson(any(), any<Class<*>>()) } throws Error("errorMessage")
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+        val actualResult = inAppSerializationManager.serializeToInAppTargetingString(inAppId, tags = null)
+        assertEquals("", actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppClickActionString returns JSON with inAppId and tags`() {
+        val tags = mapOf("templateType" to "Popup")
+        val actualResult = inAppSerializationManager.serializeToInAppClickActionString(inAppId, tags)
+        val parsed = gson.fromJson(actualResult, InAppClickRequest::class.java)
+        assertEquals(inAppId, parsed.inAppId)
+        assertEquals(tags, parsed.tags)
+    }
+
+    @Test
+    fun `serializeToInAppClickActionString omits tags when null`() {
+        val expectedResult = "{\"inappId\":\"${inAppId}\"}"
+        val actualResult = inAppSerializationManager.serializeToInAppClickActionString(inAppId, null)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppClickActionString returns empty string on error`() {
+        val gson: Gson = mockk()
+        every { gson.toJson(any(), any<Class<*>>()) } throws Error("errorMessage")
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+        val actualResult = inAppSerializationManager.serializeToInAppClickActionString(inAppId, null)
+        assertEquals("", actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppShownString returns JSON with inAppId timeToDisplay and tags`() {
+        val timeToDisplay = "0:00:00:00.2250000"
+        val tags = mapOf("layer" to "webView", "type" to "onboarding")
+        val actualResult = inAppSerializationManager.serializeToInAppShownActionString(inAppId, timeToDisplay, tags)
+        val parsed = gson.fromJson(actualResult, InAppShowRequest::class.java)
+        assertEquals(inAppId, parsed.inAppId)
+        assertEquals(timeToDisplay, parsed.timeToDisplay)
+        assertEquals(tags, parsed.tags)
+    }
+
+    @Test
+    fun `serializeToInAppShownString omits tags when null`() {
+        val timeToDisplay = "0:00:00:00.2250000"
+        val actualResult = inAppSerializationManager.serializeToInAppShownActionString(inAppId, timeToDisplay, null)
+        val parsed = gson.fromJson(actualResult, InAppShowRequest::class.java)
+        assertEquals(inAppId, parsed.inAppId)
+        assertEquals(timeToDisplay, parsed.timeToDisplay)
+        assertNull(parsed.tags)
+    }
+
+    @Test
+    fun `serializeToInAppShownString returns empty string on error`() {
+        val gson: Gson = mockk()
+        every { gson.toJson(any(), any<Class<*>>()) } throws Error("errorMessage")
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+        val actualResult = inAppSerializationManager.serializeToInAppShownActionString(inAppId, "0:00:00:00.2250000", null)
+        assertEquals("", actualResult)
+    }
+
+    @Test
+    fun `deserialize to shown inApps success`() {
+        val testString = "[\"${inAppId}\", \"$otherInAppId\"]"
+        val expectedResult = hashSetOf(inAppId, otherInAppId)
+        val actualResult = inAppSerializationManager.deserializeToShownInApps(testString)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to shown inApps error`() {
+        val testString = "someString"
+        val expectedResult = hashSetOf<String>()
+        val actualResult = inAppSerializationManager.deserializeToShownInApps(testString)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to shown inApps empty string`() {
+        val testString = ""
+        val expectedResult = hashSetOf<String>()
+        val actualResult = inAppSerializationManager.deserializeToShownInApps(testString)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `serializeToInAppShowErrorsString pins the polymorphic errors contract and never ships the legacy failures array`() {
+        val errors = listOf(
+            InAppShowFailure(
+                inAppId = inAppId,
+                failureReason = FailureReason.PRESENTATION_FAILED,
+                errorDetails = "error",
+                dateTimeUtc = "2024-02-10T00:00:00Z",
+                tags = mapOf("templateType" to "Popup")
+            ),
+            cloud.mindbox.mobile_sdk.models.operation.request.EmbeddedBlockShowFailure(
+                placeSystemName = "main-screen-top",
+                failureReason = FailureReason.WAIT_BUDGET_EXCEEDED,
+                errorDetails = "phase=config_missing; waited=00:00:30.0000000",
+                dateTimeUtc = "2024-02-10T00:00:00Z"
+            )
+        )
+
+        val actual = com.google.gson.JsonParser.parseString(
+            inAppSerializationManager.serializeToInAppShowErrorsString(errors)
+        ).asJsonObject
+
+        val expected = com.google.gson.JsonParser.parseString(
+            """
+            {"errors":[
+              {"inappId":"validInAppId","failureReason":"presentation_failed","errorDetails":"error",
+               "dateTimeUtc":"2024-02-10T00:00:00Z","tags":{"templateType":"Popup"},"${'$'}type":"inappShowFailure"},
+              {"placeSystemName":"main-screen-top","failureReason":"wait_budget_exceeded",
+               "errorDetails":"phase=config_missing; waited=00:00:30.0000000",
+               "dateTimeUtc":"2024-02-10T00:00:00Z","${'$'}type":"embeddedBlockShowFailure"}
+            ]}
+            """.trimIndent()
+        ).asJsonObject
+        assertEquals(expected, actual)
+    }
+
+    @Test
+    fun `serializeToInAppShowErrorsString returns empty string when exception occurs`() {
+        val gson: Gson = mockk()
+        val inAppShowErrors = listOf(
+            InAppShowFailure(
+                inAppId = inAppId,
+                failureReason = FailureReason.UNKNOWN_ERROR,
+                errorDetails = null,
+                dateTimeUtc = "2024-02-10T00:00:00Z"
+            )
+        )
+        every {
+            gson.toJson(any<InAppErrorsWrapper>(), object : TypeToken<InAppErrorsWrapper>() {}.type)
+        } throws RuntimeException("Serialization error")
+        inAppSerializationManager = InAppSerializationManagerImpl(gson)
+
+        val actualJson = inAppSerializationManager.serializeToInAppShowErrorsString(inAppShowErrors)
+
+        assertEquals("", actualJson)
+    }
+}

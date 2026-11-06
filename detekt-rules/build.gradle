@@ -1,0 +1,33 @@
+apply plugin: 'java-library'
+apply plugin: 'kotlin'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+compileKotlin {
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+}
+
+compileTestKotlin {
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+}
+
+dependencies {
+    implementation libs.detekt.api
+    implementation libs.kotlin.stdlib
+
+    testImplementation libs.detekt.test
+    testImplementation libs.junit
+}
+
+// CI runs `testDebugUnitTest` across the build; a plain JVM module only has `test`, so without
+// this alias the rule tests are silently skipped there.
+tasks.register('testDebugUnitTest') {
+    dependsOn 'test'
+}

@@ -1,0 +1,271 @@
+package cloud.mindbox.mobile_sdk
+
+import android.content.Context
+import android.os.Build
+import androidx.core.content.pm.PackageInfoCompat
+import cloud.mindbox.mobile_sdk.logger.MindboxLoggerImpl
+import cloud.mindbox.mobile_sdk.managers.SharedPreferencesManager
+import cloud.mindbox.mobile_sdk.repository.MindboxPreferences
+
+/**
+ * The configuration object used to initialize Maestra SDK
+ * The parameters are taken into account only during first initialization
+ */
+public class MindboxConfiguration private constructor(
+    internal val previousInstallationId: String,
+    internal val previousDeviceUUID: String,
+    internal val endpointId: String,
+    internal val domain: String,
+    internal val packageName: String,
+    internal val versionName: String,
+    internal val versionCode: String,
+    internal val subscribeCustomerIfCreated: Boolean,
+    internal val shouldCreateCustomer: Boolean,
+    internal val shouldIncludeVersionCode: Boolean,
+    internal val uuidDebugEnabled: Boolean,
+    internal val disableTrackingIds: Boolean,
+    internal val operationsDomain: String? = null,
+) {
+
+    public constructor(builder: Builder) : this(
+        previousInstallationId = builder.previousInstallationId,
+        previousDeviceUUID = builder.previousDeviceUUID,
+        endpointId = builder.endpointId,
+        domain = builder.domain,
+        packageName = builder.packageName,
+        versionName = builder.versionName,
+        versionCode = builder.versionCode,
+        subscribeCustomerIfCreated = builder.subscribeCustomerIfCreated,
+        shouldCreateCustomer = builder.shouldCreateCustomer,
+        shouldIncludeVersionCode = builder.shouldIncludeVersionCode,
+        uuidDebugEnabled = builder.uuidDebugEnabled,
+        disableTrackingIds = builder.disableTrackingIds,
+        operationsDomain = builder.operationsDomain,
+    )
+
+    internal fun copy(
+        previousInstallationId: String = this.previousInstallationId,
+        previousDeviceUUID: String = this.previousDeviceUUID,
+        endpointId: String = this.endpointId,
+        domain: String = this.domain,
+        packageName: String = this.packageName,
+        versionName: String = this.versionName,
+        versionCode: String = this.versionCode,
+        subscribeCustomerIfCreated: Boolean = this.subscribeCustomerIfCreated,
+        shouldCreateCustomer: Boolean = this.shouldCreateCustomer,
+        shouldIncludeVersionCode: Boolean = this.shouldIncludeVersionCode,
+        uuidDebugEnabled: Boolean = this.uuidDebugEnabled,
+        disableTrackingIds: Boolean = this.disableTrackingIds,
+        operationsDomain: String? = this.operationsDomain,
+    ) = MindboxConfiguration(
+        previousInstallationId = previousInstallationId,
+        previousDeviceUUID = previousDeviceUUID,
+        endpointId = endpointId,
+        domain = domain,
+        packageName = packageName,
+        versionName = versionName,
+        versionCode = versionCode,
+        subscribeCustomerIfCreated = subscribeCustomerIfCreated,
+        shouldCreateCustomer = shouldCreateCustomer,
+        shouldIncludeVersionCode = shouldIncludeVersionCode,
+        uuidDebugEnabled = uuidDebugEnabled,
+        disableTrackingIds = disableTrackingIds,
+        operationsDomain = operationsDomain,
+    )
+
+    override fun toString(): String {
+        return "MindboxConfiguration(previousInstallationId = $previousInstallationId, " +
+            "previousDeviceUUID = $previousDeviceUUID, " +
+            "endpointId = $endpointId, " +
+            "domain = $domain, " +
+            "packageName = $packageName, " +
+            "versionName = $versionName, " +
+            "versionCode = $versionCode, " +
+            "subscribeCustomerIfCreated = $subscribeCustomerIfCreated, " +
+            "shouldCreateCustomer = $shouldCreateCustomer, " +
+            "shouldIncludeVersionCode = $shouldIncludeVersionCode, " +
+            "uuidDebugEnabled = $uuidDebugEnabled, " +
+            "disableTrackingIds = $disableTrackingIds, " +
+            "operationsDomain = $operationsDomain)"
+    }
+
+    /**
+     * A Builder for MindboxConfiguration
+     */
+    public class Builder(private val context: Context, public val domain: String, public val endpointId: String) {
+
+        internal companion object {
+
+            private const val PLACEHOLDER_APP_PACKAGE_NAME = "Unknown package name"
+            private const val PLACEHOLDER_APP_VERSION_NAME = "Unknown version"
+            private const val PLACEHOLDER_APP_VERSION_CODE = "?"
+            private const val EMPTY_APP_VERSION_CODE = ""
+        }
+
+        internal var previousInstallationId: String = ""
+        internal var previousDeviceUUID: String = ""
+        internal var subscribeCustomerIfCreated: Boolean = false
+        internal var packageName: String = PLACEHOLDER_APP_PACKAGE_NAME
+        internal var versionName: String = PLACEHOLDER_APP_VERSION_NAME
+        internal var versionCode: String = PLACEHOLDER_APP_VERSION_CODE
+        internal var shouldCreateCustomer: Boolean = true
+        internal var shouldIncludeVersionCode: Boolean = true
+        internal var uuidDebugEnabled: Boolean = true
+        internal var disableTrackingIds: Boolean = false
+        internal var operationsDomain: String? = null
+
+        /**
+         * Specifies deviceUUID for Maestra
+         *
+         * @param previousDeviceUUID - deprecate - old device id which was used to find a customer by the device in our DB
+         */
+        public fun setPreviousDeviceUuid(previousDeviceUUID: String): Builder {
+            this.previousDeviceUUID = previousDeviceUUID
+            return this
+        }
+
+        /**
+         * Specifies installationId for Maestra
+         *
+         * @param previousInstallationId - deprecate - old id which was used to send mobile push
+         */
+        public fun setPreviousInstallationId(previousInstallationId: String): Builder {
+            this.previousInstallationId = previousInstallationId
+            return this
+        }
+
+        /**
+         * Specifies subscribeCustomerIfCreated for Maestra
+         *
+         * @param subscribe - flag which determines subscription status of the user
+         */
+        public fun subscribeCustomerIfCreated(subscribe: Boolean): Builder {
+            this.subscribeCustomerIfCreated = subscribe
+            return this
+        }
+
+        /**
+         * Specifies shouldCreateCustomer for Mindbox. Usable only during first initialisation
+         *
+         * @param shouldCreateCustomer - flag which determines create or not anonymous users.
+         * Default value is true.
+         */
+        public fun shouldCreateCustomer(shouldCreateCustomer: Boolean): Builder {
+            this.shouldCreateCustomer = shouldCreateCustomer
+            return this
+        }
+
+        /**
+         * Specifies whether the app versionCode is included in the app version reported
+         * to Maestra (the User-Agent header). When false, only versionName is reported.
+         *
+         * Note: starting from SDK version 3.0.0 the default value will change to false,
+         * and versionCode will not be reported unless explicitly enabled.
+         *
+         * @param shouldIncludeVersionCode - flag which determines if versionCode is reported.
+         * Default value is true.
+         */
+        public fun shouldIncludeVersionCode(shouldIncludeVersionCode: Boolean): Builder {
+            this.shouldIncludeVersionCode = shouldIncludeVersionCode
+            return this
+        }
+
+        /**
+         * Specifies if Maestra UUID copy to clipboard functionality is enabled. If enabled - UUID
+         * can be copied to clipboard by minimizing and maximizing your app 5 times in 10 seconds
+         *
+         * @param uuidDebugEnabled - flag which determines if Maestra UUID copy to clipboard
+         * functionality is enabled.
+         * Default value is true.
+         */
+        public fun uuidDebugEnabled(uuidDebugEnabled: Boolean): Builder {
+            this.uuidDebugEnabled = uuidDebugEnabled
+            return this
+        }
+
+        /**
+         * Turns off the collection of the device tracking identifier (GAID from Google Mobile
+         * Services, OAID from Huawei Mobile Services), which the SDK otherwise reports to Maestra
+         * alongside the application events.
+         *
+         * Collection is **on by default**; pass true to stop it. This is the only supported way to
+         * opt out: stripping `com.google.android.gms.permission.AD_ID` from the manifest is
+         * app-wide, cuts off every other SDK that needs the identifier, and does nothing about the
+         * OAID, which HMS does not gate behind that permission.
+         *
+         * The SDK never requests a runtime permission of its own — it reads only what the system
+         * already exposes. RuStore supplies no tracking identifier at all.
+         *
+         * Unlike most options here this one is re-read on every initialization, so it can be
+         * turned on or off in a later app version.
+         *
+         * Projects that route operations through an anonymizer never collect the identifier,
+         * whatever this option says: collection stops as soon as [operationsDomain] is set or the
+         * mobile config supplies an operations domain.
+         *
+         * @param disableTrackingIds - flag which turns the collection off. Default value is false,
+         * meaning the identifier is collected.
+         */
+        public fun disableTrackingIds(disableTrackingIds: Boolean): Builder {
+            this.disableTrackingIds = disableTrackingIds
+            return this
+        }
+
+        /**
+         * Optional host for operations (/v3/operations/async, /v3/operations/sync,
+         * /v1.1/customer/mobile-track-visit). Use when your project routes operations through
+         * an anonymizer proxy. The value may include a path prefix
+         * (e.g. "domain.com/api/v2") — operation endpoints are appended after it.
+         * A blank value is treated as not set. An invalid value is logged
+         * and ignored during SDK initialization.
+         *
+         * While an operations domain is set, the SDK does not collect the device tracking
+         * identifier (see [disableTrackingIds]).
+         */
+        public fun operationsDomain(operationsDomain: String): Builder {
+            this.operationsDomain = operationsDomain.trim().takeIf { it.isNotBlank() }
+            return this
+        }
+
+        /**
+         * Creates a new MindboxConfiguration.Builder.
+         */
+        public fun build(): MindboxConfiguration {
+            generateAppInfo(context)
+            return MindboxConfiguration(this)
+        }
+
+        private fun generateAppInfo(context: Context) {
+            try {
+                val packageManager = context.packageManager
+                //noinspection deprecation
+                val packageInfo = packageManager.getPackageInfoCompat(context, 0)
+                packageName = packageInfo.packageName.trim()
+                this.versionName = packageInfo.versionName?.trim()
+                    ?: PLACEHOLDER_APP_VERSION_NAME
+                this.versionCode =
+                    if (shouldIncludeVersionCode) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            packageInfo.longVersionCode.toString().trim()
+                        } else {
+                            PackageInfoCompat.getLongVersionCode(packageInfo).toString().trim()
+                        }
+                    } else {
+                        EMPTY_APP_VERSION_CODE
+                    }
+
+                // need for scheduling and stopping one-time background service
+                SharedPreferencesManager.with(context)
+                MindboxPreferences.hostAppName = packageName
+            } catch (_: Exception) {
+                if (!shouldIncludeVersionCode) {
+                    versionCode = EMPTY_APP_VERSION_CODE
+                }
+                MindboxLoggerImpl.e(
+                    this,
+                    "Getting app info failed. Identified as an unknown application",
+                )
+            }
+        }
+    }
+}

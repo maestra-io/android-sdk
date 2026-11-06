@@ -1,0 +1,123 @@
+package cloud.mindbox.mobile_sdk.pushes
+
+import android.content.Context
+import cloud.mindbox.mobile_sdk.isUuid
+import cloud.mindbox.mobile_sdk.logger.MindboxLog
+import cloud.mindbox.mobile_sdk.logger.MindboxLoggerImpl
+import cloud.mindbox.mobile_sdk.models.TrackingId
+import cloud.mindbox.mobile_sdk.utils.LoggingExceptionHandler
+import cloud.mindbox.mobile_sdk.utils.loggingRunCatchingSuspending
+import java.util.UUID
+
+/**
+* A class for internal sdk work only. Do not extend or use it
+* */
+public abstract class PushServiceHandler : PushConverter, MindboxLog {
+
+    public abstract val notificationProvider: String
+
+    public open val trackingIdType: String? = null
+
+    public abstract suspend fun initService(context: Context)
+
+    internal fun getAdsIdentification(context: Context): String = LoggingExceptionHandler.runCatching(
+        block = {
+            val (id, isLimitAdTrackingEnabled) = getAdsId(context)
+
+            if (isLimitAdTrackingEnabled || id == null || !id.isUsableAdsId()) {
+                logI(
+                    "Device uuid cannot be received from $notificationProvider AdvertisingIdClient. " +
+                        "Will be generated from random. " +
+                        "isLimitAdTrackingEnabled = $isLimitAdTrackingEnabled, " +
+                        "uuid from AdvertisingIdClient = $id",
+                )
+                generateRandomUuid()
+            } else {
+                logI(
+                    "Received from $notificationProvider AdvertisingIdClient: " +
+                        "device uuid - $id",
+                )
+                id
+            }
+        },
+        defaultValue = onAdsIdAcquisitionFailure(),
+    )
+
+    public abstract fun getAdsId(context: Context): Pair<String?, Boolean>
+
+    internal fun tryGetTrackingId(context: Context): TrackingIdResult {
+        val type = trackingIdType ?: return TrackingIdResult.NotSupported
+
+        if (!isServiceAvailable(context)) {
+            logI("$notificationProvider services are unavailable, cannot read $type")
+            return TrackingIdResult.Unavailable
+        }
+
+        return try {
+            val (id, isLimitAdTrackingEnabled) = getAdsId(context)
+            when {
+                isLimitAdTrackingEnabled -> {
+                    logI("$type is not available: limit ad tracking is enabled")
+                    TrackingIdResult.Denied(type)
+                }
+
+                !TrackingIdValidator.isValid(id) -> {
+                    logI("$type is not available: $notificationProvider returned no identifier")
+                    TrackingIdResult.Denied(type)
+                }
+
+                else -> {
+                    logI("Received $type from $notificationProvider")
+                    TrackingIdResult.Success(TrackingId(type = type, value = id!!))
+                }
+            }
+        } catch (e: Exception) {
+            logW("Unable to read $type from $notificationProvider. Failed with exception $e")
+            TrackingIdResult.Unavailable
+        }
+    }
+
+    internal fun isServiceAvailable(context: Context): Boolean = try {
+        val isAvailable = isAvailable(context)
+        if (!isAvailable) {
+            MindboxLoggerImpl.w(this, "$notificationProvider services are not available")
+        }
+        isAvailable
+    } catch (e: Exception) {
+        logW(
+            "Unable to determine $notificationProvider services availability. " +
+                "Failed with exception $e",
+        )
+        false
+    }
+
+    internal suspend fun registerToken(
+        context: Context,
+        previousToken: String?,
+    ): String? = loggingRunCatchingSuspending(null) {
+        val token = getToken(context)
+        if (!token.isNullOrEmpty() && token != previousToken) {
+            logI("Token gets or updates from $notificationProvider")
+        }
+        token
+    }
+
+    protected abstract fun isAvailable(context: Context): Boolean
+
+    protected abstract suspend fun getToken(context: Context): String?
+
+    private fun onAdsIdAcquisitionFailure(): (Throwable) -> String = {
+        logI(
+            "Device uuid cannot be received from $notificationProvider AdvertisingIdClient. " +
+                "Will be generated from random",
+        )
+        generateRandomUuid()
+    }
+
+    private fun generateRandomUuid() = UUID.randomUUID().toString()
+}
+
+// Both checks are needed: the format one rejects the short `0000-0000` some devices answer
+// with, the character one keeps rejecting the zero id, which `isUuid()` alone accepts.
+internal fun String.isUsableAdsId(): Boolean =
+    isUuid() && any { character -> character != '0' && character != '-' }

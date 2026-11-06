@@ -1,0 +1,712 @@
+package cloud.mindbox.mobile_sdk.inapp.data.managers.serialization
+
+import cloud.mindbox.mobile_sdk.di.modules.DataModule
+import cloud.mindbox.mobile_sdk.inapp.data.dto.BackgroundDto
+import cloud.mindbox.mobile_sdk.inapp.data.dto.PayloadDto
+import cloud.mindbox.mobile_sdk.inapp.data.managers.MobileConfigSerializationManagerImpl
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.MobileConfigSerializationManager
+import cloud.mindbox.mobile_sdk.models.InAppStub
+import cloud.mindbox.mobile_sdk.models.TreeTargetingDto
+import cloud.mindbox.mobile_sdk.models.operation.response.FormDto
+import cloud.mindbox.mobile_sdk.models.operation.response.InAppConfigStub
+import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
+import io.mockk.every
+import io.mockk.impl.annotations.MockK
+import io.mockk.junit4.MockKRule
+import io.mockk.mockk
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+
+internal class MobileConfigSerializationManagerTest {
+
+    @get:Rule
+    val mockkRule = MockKRule(this)
+
+    private lateinit var mobileConfigSerializationManager: MobileConfigSerializationManager
+    private val gson = DataModule(mockk(relaxed = true), mockk(relaxed = true)).gson
+
+    @MockK
+    private lateinit var fakeGson: Gson
+
+    @Before
+    fun onTestStart() {
+        mobileConfigSerializationManager = MobileConfigSerializationManagerImpl(gson)
+        every {
+            fakeGson.fromJson(any<String>(), TreeTargetingDto::class.java)
+        } throws Error("errorMessage")
+        every {
+            fakeGson.fromJson(any<String>(), FormDto::class.java)
+        } throws Error("errorMessage")
+    }
+
+    @Test
+    fun `deserialize to config dto blank success`() {
+        val successJson = """
+            |{
+              |"inapps": [
+                |{
+                  |"id": "040810aa-d135-49f4-8916-7e68dcc61c71",
+                  |"sdkVersion": {
+                    |"min": 1,
+                    |"max": null
+                  |},
+                  |"targeting": {
+                    |"${'$'}type": "true"
+                  |},
+                  |"form": {
+                    |"variants": [
+                      |{
+                        |"imageUrl": "https://images.example.com/wp-content/uploads/2017/06/4-5.jpg",
+                        |"redirectUrl": "https://mpush-test.example.com/inapps/040810aa-d135-49f4-8916-7e68dcc61c71",
+                        |"intentPayload": "123",
+                        |"${'$'}type": "simpleImage"
+                      |}
+                    |]
+                  |}
+                |}
+              |]
+            |}
+        """.trimMargin()
+        val expectedResult = InAppConfigStub.getConfigResponseBlank().copy(
+            inApps = listOf(
+                InAppStub.getInAppDtoBlank().copy(
+                    id = "040810aa-d135-49f4-8916-7e68dcc61c71",
+                    sdkVersion = InAppStub.getSdkVersion().copy(minVersion = 1, maxVersion = null),
+                    targeting = JsonObject().apply {
+                        addProperty("${'$'}type", "true")
+                    },
+                    form = JsonObject().apply {
+                        add("variants", JsonArray().apply {
+                            add(JsonObject().apply {
+                                addProperty(
+                                    "imageUrl",
+                                    "https://images.example.com/wp-content/uploads/2017/06/4-5.jpg"
+                                )
+                                addProperty(
+                                    "redirectUrl",
+                                    "https://mpush-test.example.com/inapps/040810aa-d135-49f4-8916-7e68dcc61c71"
+                                )
+                                addProperty("${'$'}type", "simpleImage")
+                                addProperty("intentPayload", "123")
+                            })
+                        })
+                    }
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToConfigDtoBlank(successJson)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to config dto blank empty string`() {
+        val invalidJson = ""
+        assertNull(mobileConfigSerializationManager.deserializeToConfigDtoBlank(invalidJson))
+    }
+
+    @Test
+    fun `deserialize to config dto blank invalid json`() {
+        val invalidJson = "invalidJson"
+        assertNull(mobileConfigSerializationManager.deserializeToConfigDtoBlank(invalidJson))
+    }
+
+    @Test
+    fun `deserialize to inApp targetingDto success`() {
+        val expectedResult = InAppStub.getTargetingTrueNodeDto().copy(type = "true")
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "true")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app targeting city dto success`() {
+        val expectedResult = InAppStub.getTargetingCityNodeDto()
+            .copy(type = "city", kind = "positive", listOf(123))
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "city")
+                addProperty("kind", "positive")
+                add("ids", JsonArray().apply {
+                    add("123")
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app targeting country dto success`() {
+        val expectedResult = InAppStub.getTargetingCountryNodeDto()
+            .copy(type = "country", kind = "positive", listOf(123))
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "country")
+                addProperty("kind", "positive")
+                add("ids", JsonArray().apply {
+                    add("123")
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app targeting region dto success`() {
+        val expectedResult = InAppStub.getTargetingRegionNodeDto()
+            .copy(type = "region", kind = "positive", listOf(123))
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "region")
+                addProperty("kind", "positive")
+                add("ids", JsonArray().apply {
+                    add("123")
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app segment dto success`() {
+        val expectedResult = InAppStub.getTargetingSegmentNodeDto().copy(
+            type = "segment",
+            kind = "positive",
+            segmentExternalId = "123",
+            segmentationExternalId = "213",
+            segmentationInternalId = "222"
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "segment")
+                addProperty("kind", "positive")
+                addProperty("segmentExternalId", "123")
+                addProperty("segmentationExternalId", "213")
+                addProperty("segmentationInternalId", "222")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app operation dto success`() {
+        val expectedResult = InAppStub.getTargetingOperationNodeDto().copy(
+            type = "apiMethodCall",
+            systemName = "test"
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "apiMethodCall")
+                addProperty("systemName", "test")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to inapp view product category dto success`() {
+        val expectedResult = InAppStub.viewProductCategoryNodeDto.copy(
+            type = "viewProductCategoryId",
+            kind = "substring",
+            value = "test"
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "viewProductCategoryId")
+                addProperty("kind", "substring")
+                addProperty("value", "test")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to inapp view product category in dto success`() {
+        val expectedResult = InAppStub.viewProductCategoryInNodeDto.copy(
+            type = "viewProductCategoryIdIn",
+            kind = "any",
+            values = listOf(
+                InAppStub.viewProductCategoryInValueDto.copy(
+                    id = "id",
+                    externalId = "externalId",
+                    externalSystemName = "externalSystemName",
+                )
+            )
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "viewProductCategoryIdIn")
+                addProperty("kind", "any")
+                add("values", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("id", "id")
+                        addProperty("externalId", "externalId")
+                        addProperty("externalSystemName", "externalSystemName")
+                    })
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app intersection dto success`() {
+        val expectedResult = InAppStub.getTargetingIntersectionNodeDto().copy(
+            type = "and",
+            nodes = listOf(InAppStub.getTargetingTrueNodeDto().copy(type = "true"))
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "and")
+                add("nodes", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("${'$'}type", "true")
+                    })
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to in app union dto success`() {
+        val expectedResult = InAppStub.getTargetingUnionNodeDto().copy(
+            type = "or",
+            nodes = listOf(InAppStub.getTargetingTrueNodeDto().copy(type = "true"))
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "or")
+                add("nodes", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("${'$'}type", "true")
+                    })
+                })
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to inapp view product dto success`() {
+        val expectedResult = InAppStub.getTargetingViewProductNodeDto().copy(
+            type = "viewProductId",
+            kind = "substring",
+            value = "test"
+        )
+
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "viewProductId")
+                addProperty("kind", "substring")
+                addProperty("value", "test")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to inapp view product segment dto success`() {
+        val expectedResult = InAppStub.getTargetingViewProductSegmentNodeDto().copy(
+            type = "viewProductSegment",
+            kind = "positive",
+            segmentExternalId = "segmentExternalId",
+            segmentationInternalId = "segmentationInternalId",
+            segmentationExternalId = "segmentationExternalId"
+        )
+        val actualResult =
+            mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+                addProperty("${'$'}type", "viewProductSegment")
+                addProperty("kind", "positive")
+                addProperty("segmentExternalId", "segmentExternalId")
+                addProperty("segmentationInternalId", "segmentationInternalId")
+                addProperty("segmentationExternalId", "segmentationExternalId")
+            }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to inApp targetingDto invalid json object`() {
+        assertNull(mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject(), "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to inApp targetingDto null`() {
+        assertNull(mobileConfigSerializationManager.deserializeToInAppTargetingDto(null, "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to inApp targetingDto throws error`() {
+        mobileConfigSerializationManager = MobileConfigSerializationManagerImpl(fakeGson)
+        assertNull(mobileConfigSerializationManager.deserializeToInAppTargetingDto(JsonObject().apply {
+            addProperty("${'$'}type", "true")
+        }, "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to modal window inApp form dto success`() {
+        val color = "#000000"
+        val lineWidth = 4.0
+        val type = "closeButton"
+        val expectedResult = InAppStub.getFormDto().copy(
+            variants = listOf(
+                InAppStub.getModalWindowDto().copy(
+                    type = "modal", content = InAppStub.getModalWindowContentDto().copy(
+                        background = InAppStub.getBackgroundDto().copy(layers = listOf(InAppStub.getImageLayerDto().copy(
+                            action = InAppStub.getRedirectUrlActionDto().copy(
+                                intentPayload = "123", type = "redirectUrl",
+                                value = "https://mpush-test.example.com/inapps/040810aa-d135-49f4-8916-7e68dcc61c71"
+                            ), source = InAppStub.getUrlSourceDto().copy(
+                                type = "url", value = "https://images.example.com/wp-content/uploads/2017/06/4-5.jpg"
+                            ), type = "image"
+                        ))), elements = listOf(InAppStub.getCloseButtonElementDto().copy(
+                            color = color, lineWidth = lineWidth, position = InAppStub.getElementPositionDto().copy(
+                                margin = InAppStub.getElementMarginDto().copy(
+                                    bottom = 0.03,
+                                    kind = "proportion",
+                                    left = 0.03,
+                                    right = 0.03,
+                                    top = 0.03
+                                )
+                            ), size = InAppStub.getElementSizeDto().copy(
+                                height = 24.0,
+                                kind = "dp",
+                                width = 24.0
+                            ), type = type
+                        ))
+                    ),
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject().apply {
+            add("variants", JsonArray().apply {
+                val variantObject = JsonObject().apply {
+                    addProperty("${"$"}type", "modal")
+                    add("content", JsonObject().apply {
+                        add("background", JsonObject().apply {
+                            add("layers", JsonArray().apply {
+                                val imageLayerObject = JsonObject().apply {
+                                    add("action", JsonObject().apply {
+                                        addProperty("intentPayload", "123")
+                                        addProperty("${"$"}type", "redirectUrl")
+                                        addProperty("value", "https://mpush-test.example.com/inapps/040810aa-d135-49f4-8916-7e68dcc61c71")
+                                    })
+                                    add("source", JsonObject().apply {
+                                        addProperty("${"$"}type", "url")
+                                        addProperty("value", "https://images.example.com/wp-content/uploads/2017/06/4-5.jpg")
+                                    })
+                                    addProperty("${"$"}type", "image")
+                                }
+                                add(imageLayerObject)
+                            })
+                        })
+                        add("elements", JsonArray().apply {
+                            val elementObject = JsonObject().apply {
+                                addProperty("color", color)
+                                addProperty("lineWidth", lineWidth)
+                                add("position", JsonObject().apply {
+                                    add("margin", JsonObject().apply {
+                                        addProperty("bottom", 0.03)
+                                        addProperty("kind", "proportion")
+                                        addProperty("left", 0.03)
+                                        addProperty("right", 0.03)
+                                        addProperty("top", 0.03)
+                                    })
+                                })
+                                add("size", JsonObject().apply {
+                                    addProperty("height", 24.0)
+                                    addProperty("kind", "dp")
+                                    addProperty("width", 24.0)
+                                })
+                                addProperty("${"$"}type", type)
+                            }
+                            add(elementObject)
+                        })
+                    })
+                }
+                add(variantObject)
+            })
+        }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to modal window inApp form dto with PushPermission action success`() {
+        val expectedResult = InAppStub.getFormDto().copy(
+            variants = listOf(
+                InAppStub.getModalWindowDto().copy(
+                    type = "modal", content = InAppStub.getModalWindowContentDto().copy(
+                        background = InAppStub.getBackgroundDto().copy(layers = listOf(InAppStub.getImageLayerDto().copy(
+                            action = InAppStub.getPushPermissionActionDto().copy(
+                                intentPayload = "123", type = "pushPermission"
+                            ), source = InAppStub.getUrlSourceDto()
+                        ))), elements = null
+                    ),
+                )
+            )
+        )
+
+        val actualResult = mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject().apply {
+            add("variants", JsonArray().apply {
+                val variantObject = JsonObject().apply {
+                    addProperty("${"$"}type", "modal")
+                    add("content", JsonObject().apply {
+                        add("background", JsonObject().apply {
+                            add("layers", JsonArray().apply {
+                                val imageLayerObject = JsonObject().apply {
+                                    add("action", JsonObject().apply {
+                                        addProperty("intentPayload", "123")
+                                        addProperty("${"$"}type", "pushPermission")
+                                    })
+                                    add("source", JsonObject().apply {
+                                        addProperty("${"$"}type", "url")
+                                        addProperty("value", "")
+                                    })
+                                    addProperty("${"$"}type", "image")
+                                }
+                                add(imageLayerObject)
+                            })
+                        })
+                    })
+                }
+                add(variantObject)
+            })
+        }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to modal window inApp form dto with webview layer success`() {
+        val baseUrl = "https://inapp.local/popup"
+        val contentUrl = "https://inapp-dev.html"
+        val formId = "73379"
+        val webViewLayerDto = BackgroundDto.LayerDto.WebViewLayerDto(
+            baseUrl = baseUrl,
+            contentUrl = contentUrl,
+            type = "webview",
+            params = mapOf("formId" to formId)
+        )
+        val expectedResult = InAppStub.getFormDto().copy(
+            variants = listOf(
+                InAppStub.getModalWindowDto().copy(
+                    type = "modal",
+                    content = InAppStub.getModalWindowContentDto().copy(
+                        background = InAppStub.getBackgroundDto().copy(
+                            layers = listOf(webViewLayerDto)
+                        ),
+                        elements = null
+                    )
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject().apply {
+            add("variants", JsonArray().apply {
+                val variantObject = JsonObject().apply {
+                    addProperty("${"$"}type", "modal")
+                    add("content", JsonObject().apply {
+                        add("background", JsonObject().apply {
+                            add("layers", JsonArray().apply {
+                                val webViewLayerObject = JsonObject().apply {
+                                    addProperty("${"$"}type", "webview")
+                                    addProperty("baseUrl", baseUrl)
+                                    addProperty("contentUrl", contentUrl)
+                                    add("params", JsonObject().apply {
+                                        addProperty("formId", formId)
+                                    })
+                                }
+                                add(webViewLayerObject)
+                            })
+                        })
+                        add("elements", com.google.gson.JsonNull.INSTANCE)
+                    })
+                }
+                add(variantObject)
+            })
+        }, "inapp-id")
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize webview layer params converts all values to string`() {
+        val baseUrl = "https://inapp.local/popup"
+        val contentUrl = "https://inapp-dev.html"
+        val actualResult = mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject().apply {
+            add("variants", JsonArray().apply {
+                val variantObject = JsonObject().apply {
+                    addProperty("${"$"}type", "modal")
+                    add("content", JsonObject().apply {
+                        add("background", JsonObject().apply {
+                            add("layers", JsonArray().apply {
+                                val webViewLayerObject = JsonObject().apply {
+                                    addProperty("${"$"}type", "webview")
+                                    addProperty("baseUrl", baseUrl)
+                                    addProperty("contentUrl", contentUrl)
+                                    add("params", JsonObject().apply {
+                                        addProperty("formId", "73379")
+                                        addProperty("validKey", "validValue")
+                                        addProperty("numberKey", 123)
+                                        add("objectKey", JsonObject().apply { addProperty("nested", "value") })
+                                        add("nullKey", com.google.gson.JsonNull.INSTANCE)
+                                    })
+                                }
+                                add(webViewLayerObject)
+                            })
+                        })
+                        add("elements", JsonArray())
+                    })
+                }
+                add(variantObject)
+            })
+        }, "inapp-id")
+        val layers = actualResult?.variants?.firstOrNull()
+            ?.let { it as? PayloadDto.ModalWindowDto }?.content?.background?.layers
+        val webViewLayer = layers?.firstOrNull() as? BackgroundDto.LayerDto.WebViewLayerDto
+        assertNotNull(webViewLayer)
+        assertEquals("73379", webViewLayer?.params!!["formId"])
+        assertEquals("validValue", webViewLayer.params["validKey"])
+        assertEquals("123", webViewLayer.params["numberKey"])
+        assertEquals("{\"nested\":\"value\"}", webViewLayer.params["objectKey"])
+        assertFalse(webViewLayer.params.containsKey("nullKey"))
+    }
+
+    @Test
+    fun `deserialize to inApp formDto invalid json object`() {
+        assertNull(mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject(), "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to inApp formDto null`() {
+        assertNull(mobileConfigSerializationManager.deserializeToInAppFormDto(null, "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to inApp formDto throws error`() {
+        mobileConfigSerializationManager = MobileConfigSerializationManagerImpl(fakeGson)
+        assertNull(mobileConfigSerializationManager.deserializeToInAppFormDto(JsonObject().apply {
+            add("variants", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty(
+                        "imageUrl",
+                        "https://images.example.com/wp-content/uploads/2017/06/4-5.jpg"
+                    )
+                    addProperty(
+                        "redirectUrl",
+                        "https://mpush-test.example.com/inapps/040810aa-d135-49f4-8916-7e68dcc61c71"
+                    )
+                    addProperty("${'$'}type", "simpleImage")
+                    addProperty("intentPayload", "123")
+                })
+            })
+        }, "inapp-id"))
+    }
+
+    @Test
+    fun `deserialize to config dto blank with tags success`() {
+        val successJson = gson.toJson(JsonObject().apply {
+            add("inapps", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty("id", "040810aa-d135-49f4-8916-7e68dcc61c71")
+                    add("sdkVersion", JsonObject().apply {
+                        addProperty("min", 1)
+                        add("max", com.google.gson.JsonNull.INSTANCE)
+                    })
+                    add("targeting", JsonObject().apply {
+                        addProperty("${"$"}type", "true")
+                    })
+                    add("tags", JsonObject().apply {
+                        addProperty("layer", "webView")
+                        addProperty("type", "onboarding")
+                    })
+                    add("form", JsonObject().apply {
+                        add("variants", JsonArray())
+                    })
+                })
+            })
+        })
+        val expectedResult = InAppConfigStub.getConfigResponseBlank().copy(
+            inApps = listOf(
+                InAppStub.getInAppDtoBlank().copy(
+                    id = "040810aa-d135-49f4-8916-7e68dcc61c71",
+                    sdkVersion = InAppStub.getSdkVersion().copy(minVersion = 1, maxVersion = null),
+                    targeting = JsonObject().apply { addProperty("${'$'}type", "true") },
+                    form = JsonObject().apply { add("variants", JsonArray()) },
+                    tags = mapOf("layer" to "webView", "type" to "onboarding")
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToConfigDtoBlank(successJson)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to config dto blank with empty tags success`() {
+        val successJson = gson.toJson(JsonObject().apply {
+            add("inapps", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty("id", "040810aa-d135-49f4-8916-7e68dcc61c71")
+                    add("sdkVersion", JsonObject().apply {
+                        addProperty("min", 1)
+                        add("max", com.google.gson.JsonNull.INSTANCE)
+                    })
+                    add("targeting", JsonObject().apply {
+                        addProperty("${"$"}type", "true")
+                    })
+                    add("tags", JsonObject())
+                    add("form", JsonObject().apply {
+                        add("variants", JsonArray())
+                    })
+                })
+            })
+        })
+        val expectedResult = InAppConfigStub.getConfigResponseBlank().copy(
+            inApps = listOf(
+                InAppStub.getInAppDtoBlank().copy(
+                    id = "040810aa-d135-49f4-8916-7e68dcc61c71",
+                    sdkVersion = InAppStub.getSdkVersion().copy(minVersion = 1, maxVersion = null),
+                    targeting = JsonObject().apply { addProperty("${'$'}type", "true") },
+                    form = JsonObject().apply { add("variants", JsonArray()) },
+                    tags = emptyMap()
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToConfigDtoBlank(successJson)
+        assertEquals(expectedResult, actualResult)
+    }
+
+    @Test
+    fun `deserialize to config dto blank with non-string tag values skips them success`() {
+        val successJson = gson.toJson(JsonObject().apply {
+            add("inapps", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty("id", "040810aa-d135-49f4-8916-7e68dcc61c71")
+                    add("sdkVersion", JsonObject().apply {
+                        addProperty("min", 1)
+                        add("max", com.google.gson.JsonNull.INSTANCE)
+                    })
+                    add("targeting", JsonObject().apply {
+                        addProperty("${"$"}type", "true")
+                    })
+                    add("tags", JsonObject().apply {
+                        addProperty("layer", "webView")
+                        addProperty("count", 42)
+                        addProperty("flag", true)
+                    })
+                    add("form", JsonObject().apply {
+                        add("variants", JsonArray())
+                    })
+                })
+            })
+        })
+        val expectedResult = InAppConfigStub.getConfigResponseBlank().copy(
+            inApps = listOf(
+                InAppStub.getInAppDtoBlank().copy(
+                    id = "040810aa-d135-49f4-8916-7e68dcc61c71",
+                    sdkVersion = InAppStub.getSdkVersion().copy(minVersion = 1, maxVersion = null),
+                    targeting = JsonObject().apply { addProperty("${'$'}type", "true") },
+                    form = JsonObject().apply { add("variants", JsonArray()) },
+                    tags = mapOf("layer" to "webView")
+                )
+            )
+        )
+        val actualResult = mobileConfigSerializationManager.deserializeToConfigDtoBlank(successJson)
+        assertEquals(expectedResult, actualResult)
+    }
+}

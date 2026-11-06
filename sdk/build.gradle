@@ -1,0 +1,108 @@
+apply plugin: "java-platform"
+apply from: "../modulesCommon.gradle"
+apply plugin: 'com.google.devtools.ksp'
+
+
+javaPlatform {
+    allowDependencies()
+}
+dependencies {
+    constraints {
+        api("cloud.mindbox:mindbox-firebase:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-huawei:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-rustore:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-firebase-starter:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-huawei-starter:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-rustore-starter:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-sdk-starter-core:$SDK_VERSION_NAME")
+        api("cloud.mindbox:mindbox-embedded-compose:$SDK_VERSION_NAME")
+    }
+}
+android {
+    namespace 'cloud.mindbox.mobile_sdk'
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    defaultConfig {
+        consumerProguardFiles "consumer-rules.pro",
+                    "../proguard/proguard-gson.pro",
+                    "../proguard/proguard-kotlin.pro",
+                    "../proguard/proguard-room.pro",
+                    "../proguard/proguard-volley.pro",
+                    "../proguard/proguard-workmanager.pro",
+                    "../proguard/proguard-lifecycle.pro"
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            maxParallelForks = Math.min(4, Math.max(1, Runtime.runtime.availableProcessors().intdiv(2)))
+            maxHeapSize = "1536m"
+        }
+    }
+    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+        kotlinOptions {
+            freeCompilerArgs += "-opt-in=kotlin.RequiresOptIn"
+        }
+    }
+}
+
+def useLocalMindboxCommon = providers.gradleProperty("USE_LOCAL_MINDBOX_COMMON").map { it.toBoolean() }.getOrElse(false)
+println("USE_LOCAL_MINDBOX_COMMON: $useLocalMindboxCommon")
+
+dependencies {
+    // Internal dependencies
+    if (useLocalMindboxCommon) {
+        implementation(project(path: ":mindbox-common")) {
+            exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib"
+        }
+    } else {
+        implementation("cloud.mindbox:mindbox-common:$SDK_VERSION_NAME") {
+            exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib"
+        }
+    }
+
+    // Implementation dependencies
+    implementation libs.kotlin.stdlib
+    implementation libs.androidx.core.ktx
+    implementation libs.appcompat
+
+    // ConstraintLayout
+    implementation libs.constraint.layout
+
+    // Coroutines
+    implementation(platform(libs.kotlinx.coroutines.bom))
+    implementation libs.kotlinx.coroutines.core
+    implementation libs.kotlinx.coroutines.android
+
+    // Network
+    implementation libs.volley
+    implementation libs.gson
+
+    // Database
+    implementation libs.room.runtime
+    implementation libs.room.ktx
+    ksp libs.room.compiler
+
+    // Work Manager
+    implementation libs.work.manager
+
+    // Handle app lifecycle
+    implementation libs.androidx.lifecycle
+    implementation libs.androidx.lifecycle.runtime
+    implementation libs.androidx.startup
+    implementation libs.threetenabp
+
+    // Glide
+    implementation libs.glide
+    ksp libs.glide.compiler
+
+    // Test dependencies
+    testImplementation libs.bundles.test
+
+    // Android Test dependencies
+    androidTestImplementation libs.bundles.androidTest
+
+}

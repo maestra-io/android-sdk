@@ -1,0 +1,229 @@
+package cloud.mindbox.mobile_sdk.inapp.presentation.view
+
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.content.IntentFilter
+import androidx.test.core.app.ApplicationProvider
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+
+@RunWith(RobolectricTestRunner::class)
+internal class WebViewLinkRouterTest {
+
+    private lateinit var context: Context
+    private lateinit var router: MindboxWebViewLinkRouter
+
+    @Before
+    fun setUp() {
+        context = ApplicationProvider.getApplicationContext()
+        router = MindboxWebViewLinkRouter(context)
+    }
+
+    @Test
+    fun `executeOpenLink opens web links from pdf cases`() {
+        registerBrowsableHandler("https")
+        val inputUrls: List<String> = listOf(
+            "https://www.google.com",
+            "https://habr.com/ru/articles/",
+            "https://test-site.g.example.com",
+            "https://test-site.g.example.com/some/path?param=1",
+            "https://example.com",
+            "https://example.com/products",
+            "https://www.youtube.com/watch?v=abc",
+            "https://t.me/durov",
+        )
+        inputUrls.forEach { inputUrl: String ->
+            val actualResult: Result<String> = executeOpenLink(url = inputUrl)
+            assertTrue(actualResult.isSuccess)
+            assertEquals(inputUrl, actualResult.getOrNull())
+        }
+    }
+
+    @Test
+    fun `executeOpenLink opens deeplink schemes from pdf cases`() {
+        registerBrowsableHandler("pushok")
+        val inputUrls: List<String> = listOf(
+            "pushok://",
+            "pushok://product/123",
+            "pushok://catalog?category=shoes&sort=price",
+        )
+        inputUrls.forEach { inputUrl: String ->
+            val actualResult: Result<String> = executeOpenLink(url = inputUrl)
+            assertTrue(actualResult.isSuccess)
+            assertEquals(inputUrl, actualResult.getOrNull())
+        }
+    }
+
+    @Test
+    fun `executeOpenLink opens intent uri`() {
+        registerBrowsableHandler("myapp")
+        val intentUrl: String =
+            "intent://catalog/item/1#Intent;scheme=myapp;S.browser_fallback_url=https%3A%2F%2Fexample.com;end"
+        val result: Result<String> = router.executeOpenLink("""{"url":"$intentUrl"}""")
+        assertTrue(result.isSuccess)
+        assertEquals(intentUrl, result.getOrNull())
+    }
+
+    @Test
+    fun `executeOpenLink opens system schemes from pdf cases`() {
+        registerActionHandler(action = Intent.ACTION_DIAL, scheme = "tel")
+        registerActionHandler(action = Intent.ACTION_SENDTO, scheme = "mailto")
+        registerActionHandler(action = Intent.ACTION_SENDTO, scheme = "sms")
+        val inputUrls: List<String> = listOf(
+            "tel:+1234567890",
+            "mailto:test@example.com",
+            "sms:+1234567890",
+        )
+        inputUrls.forEach { inputUrl: String ->
+            val actualResult: Result<String> = executeOpenLink(url = inputUrl)
+            assertTrue(actualResult.isSuccess)
+            assertEquals(inputUrl, actualResult.getOrNull())
+        }
+    }
+
+    @Test
+    fun `executeOpenLink returns error for blocked schemes from pdf cases`() {
+        val blockedUrls: List<String> = listOf(
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<h1>blocked</h1>",
+            "blob:https://example.com/uuid",
+        )
+        blockedUrls.forEach { blockedUrl: String ->
+            val actualResult: Result<String> = executeOpenLink(url = blockedUrl)
+            assertFalse(actualResult.isSuccess)
+            assertErrorCode(result = actualResult, expectedCode = BridgeErrorCode.BLOCKED_SCHEME)
+        }
+    }
+
+    @Test
+    fun `executeOpenLink returns error for invalid or missing scheme urls`() {
+        val invalidResult: Result<String> = executeOpenLink(url = "not a url at all")
+        val missingSchemeResult: Result<String> = executeOpenLink(url = "://missing-scheme")
+        assertFalse(invalidResult.isSuccess)
+        assertFalse(missingSchemeResult.isSuccess)
+        assertErrorCode(result = invalidResult, expectedCode = BridgeErrorCode.INVALID_URL)
+        assertErrorCode(result = missingSchemeResult, expectedCode = BridgeErrorCode.INVALID_URL)
+    }
+
+    @Test
+    fun `executeOpenLink returns error for unknown scheme without activity`() {
+        val activityNotFoundRouter: MindboxWebViewLinkRouter = createRouterWithActivityNotFoundError()
+        val result: Result<String> = activityNotFoundRouter.executeOpenLink("""{"url":"nonexistent-scheme://test"}""")
+        assertFalse(result.isSuccess)
+        assertErrorCode(result = result, expectedCode = BridgeErrorCode.OPEN_FAILED)
+    }
+
+    @Test
+    fun `executeOpenLink returns error for invalid payload cases from pdf`() {
+        val nullPayloadResult: Result<String> = router.executeOpenLink(null)
+        val emptyPayloadResult: Result<String> = router.executeOpenLink("")
+        val blankPayloadResult: Result<String> = router.executeOpenLink("   ")
+        val missingUrlResult: Result<String> = router.executeOpenLink("""{"foo":"bar"}""")
+        val emptyUrlResult: Result<String> = router.executeOpenLink("""{"url":""}""")
+        val invalidJsonResult: Result<String> = router.executeOpenLink("""{not-json}""")
+        val notObjectJsonResult: Result<String> = router.executeOpenLink("""["https://example.com"]""")
+        val payloadResults: List<Result<String>> = listOf(
+            nullPayloadResult,
+            emptyPayloadResult,
+            blankPayloadResult,
+            missingUrlResult,
+            emptyUrlResult,
+            invalidJsonResult,
+            notObjectJsonResult,
+        )
+        payloadResults.forEach { actualResult: Result<String> ->
+            assertFalse(actualResult.isSuccess)
+            assertErrorCode(result = actualResult, expectedCode = BridgeErrorCode.INVALID_PAYLOAD)
+        }
+    }
+
+    @Test
+    fun `executeOpenLink refuses a url of the wrong json type as invalid_payload`() {
+        val payloads: List<String> = listOf(
+            """{"url":123}""",
+            """{"url":true}""",
+            """{"url":{}}""",
+            """{"url":null}""",
+            """{"url":[]}""",
+            """{"url":["a","b"]}""",
+        )
+        payloads.forEach { payload: String ->
+            val actualResult: Result<String> = router.executeOpenLink(payload)
+            assertFalse(actualResult.isSuccess)
+            assertErrorCode(result = actualResult, expectedCode = BridgeErrorCode.INVALID_PAYLOAD)
+        }
+    }
+
+    private fun executeOpenLink(url: String): Result<String> {
+        return router.executeOpenLink("""{"url":"$url"}""")
+    }
+
+    private fun assertErrorCode(
+        result: Result<String>,
+        expectedCode: BridgeErrorCode,
+    ) {
+        val actualError: Throwable? = result.exceptionOrNull()
+        assertNotNull(actualError)
+        assertEquals(expectedCode, (actualError as? BridgeRefusalException)?.code)
+    }
+
+    private fun createRouterWithActivityNotFoundError(): MindboxWebViewLinkRouter {
+        val wrappedContext: Context = object : ContextWrapper(context) {
+            override fun startActivity(intent: Intent) {
+                throw ActivityNotFoundException("No activity found")
+            }
+        }
+        return MindboxWebViewLinkRouter(wrappedContext)
+    }
+
+    private fun registerBrowsableHandler(scheme: String) {
+        registerHandler(
+            action = Intent.ACTION_VIEW,
+            scheme = scheme,
+            isBrowsable = true,
+        )
+    }
+
+    private fun registerActionHandler(
+        action: String,
+        scheme: String,
+    ) {
+        registerHandler(
+            action = action,
+            scheme = scheme,
+            isBrowsable = false,
+        )
+    }
+
+    private fun registerHandler(
+        action: String,
+        scheme: String,
+        isBrowsable: Boolean,
+    ) {
+        val componentName: ComponentName = ComponentName("com.example", "TestActivityFor_${action}_$scheme")
+        val packageManager = shadowOf(RuntimeEnvironment.getApplication().packageManager)
+        packageManager.addActivityIfNotPresent(componentName)
+        packageManager.addIntentFilterForActivity(
+            componentName,
+            IntentFilter(action).apply {
+                addCategory(Intent.CATEGORY_DEFAULT)
+                if (isBrowsable) {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                }
+                addDataScheme(scheme)
+            }
+        )
+    }
+}

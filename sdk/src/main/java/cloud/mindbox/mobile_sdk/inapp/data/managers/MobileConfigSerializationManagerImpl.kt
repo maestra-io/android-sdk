@@ -1,0 +1,249 @@
+package cloud.mindbox.mobile_sdk.inapp.data.managers
+
+import cloud.mindbox.mobile_sdk.fromJson
+import cloud.mindbox.mobile_sdk.getOrNull
+import cloud.mindbox.mobile_sdk.inapp.data.dto.*
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.MobileConfigSerializationManager
+import cloud.mindbox.mobile_sdk.logger.mindboxLogE
+import cloud.mindbox.mobile_sdk.logger.mindboxLogW
+import cloud.mindbox.mobile_sdk.models.TreeTargetingDto
+import cloud.mindbox.mobile_sdk.models.operation.response.*
+import cloud.mindbox.mobile_sdk.models.operation.response.InAppConfigResponseBlank.InAppDtoBlank
+import cloud.mindbox.mobile_sdk.models.operation.response.SettingsDtoBlank.*
+import cloud.mindbox.mobile_sdk.utils.Constants
+import cloud.mindbox.mobile_sdk.utils.RuntimeTypeAdapterFactory.UnknownSubtypeException
+import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+
+internal class MobileConfigSerializationManagerImpl(private val gson: Gson) :
+    MobileConfigSerializationManager {
+
+    override fun deserializeToInAppTargetingDto(inAppTreeTargeting: JsonObject?, inAppId: String): TreeTargetingDto? {
+        val result = runCatching {
+            gson.fromJson(inAppTreeTargeting, TreeTargetingDto::class.java)
+        }
+        result.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, inAppTreeTargeting, error)
+        }
+        return result.getOrNull()
+    }
+
+    override fun deserializeToFrequencyDto(frequency: JsonElement?, inAppId: String): FrequencyDto? {
+        val result = runCatching {
+            gson.fromJson(frequency, FrequencyDto::class.java)
+        }
+        result.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, frequency, error)
+        }
+        return result.getOrNull()
+    }
+
+    override fun deserializeToDisplayConditionsDto(displayConditions: JsonElement?, inAppId: String): DisplayConditionsDto? {
+        if (displayConditions == null || displayConditions.isJsonNull) return null
+        val result = runCatching {
+            gson.fromJson(displayConditions, DisplayConditionsDto::class.java)
+        }
+        result.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, displayConditions, error)
+        }
+        return result.getOrNull()
+    }
+
+    override fun deserializeToConfigDtoBlank(inAppConfig: String): InAppConfigResponseBlank? {
+        val jsonObject = runCatching {
+            JsonParser.parseString(inAppConfig).asJsonObject
+        }.getOrElse {
+            mindboxLogE("Failed to parse inAppConfig json", it)
+            return null
+        }
+
+        val inApps = jsonObject.getOrNull("inapps")?.let { deserializeInApps(it) }
+        val settings = jsonObject.getOrNull("settings")?.let { deserializeSettings(it) }
+        val abtests = jsonObject.getOrNull("abtests")?.let { deserializeAbtests(it) }
+        val monitoring = jsonObject.getOrNull("monitoring")?.let { deserializeMonitoring(it) }
+
+        return InAppConfigResponseBlank(inApps, monitoring, settings, abtests)
+    }
+
+    internal fun deserializeMonitoring(json: JsonElement?): MonitoringDto? = runCatching {
+        MonitoringDto(logs = json!!
+            .asJsonObject.get("logs")
+            .asJsonArray.mapNotNull { log ->
+                runCatching {
+                    gson.fromJson(log, LogRequestDtoBlank::class.java)?.copy()
+                }.getOrNull {
+                    mindboxLogE("Failed to parse logs block", it)
+                }
+            })
+    }.getOrNull {
+        mindboxLogE("Failed to parse monitoring block", it)
+    }
+
+    internal fun deserializeInApps(json: JsonElement?): List<InAppDtoBlank>? =
+        gson.fromJson<List<InAppDtoBlank>>(json)
+            .getOrNull {
+                mindboxLogE("Failed to parse inapps block", it)
+            }
+
+    internal fun deserializeSettings(json: JsonElement?): SettingsDtoBlank? = runCatching {
+        json?.let {
+            val operations = json.asJsonObject.get("operations")?.let { operationsJson ->
+                runCatching {
+                    operationsJson.asJsonObject.entrySet().associate { (key, value) ->
+                        key to runCatching {
+                            gson.fromJson(value, OperationDtoBlank::class.java)?.copy()
+                        }.getOrNull {
+                            mindboxLogE("Failed to parse operation $key", it)
+                        }
+                    }.filterValues { it != null }
+                }.getOrNull {
+                    mindboxLogE("Failed to parse operations block", it)
+                }
+            }
+
+            val ttl = runCatching {
+                gson.fromJson(json.asJsonObject.get("ttl"), TtlDtoBlank::class.java)?.copy()
+            }.getOrNull {
+                mindboxLogE("Failed to parse ttl block", it)
+            }
+
+            val slidingExpiration = runCatching {
+                gson.fromJson(json.asJsonObject.get("slidingExpiration"), SlidingExpirationDtoBlank::class.java)?.copy()
+            }.getOrNull {
+                mindboxLogE("Failed to parse slidingExpiration block")
+            }
+
+            val inappSettings = runCatching {
+                gson.fromJson(json.asJsonObject.get("inapp"), InappSettingsDtoBlank::class.java)?.copy()
+            }.getOrNull {
+                mindboxLogE("Failed to parse inapp block in settings section ")
+            }
+
+            val featureToggles = runCatching {
+                gson.fromJson(json.asJsonObject.get("featureToggles"), FeatureTogglesDtoBlank::class.java)?.copy()
+            }.getOrNull {
+                mindboxLogE("Failed to parse featureToggles block in settings section")
+            }
+
+            val baseAddresses = runCatching {
+                gson.fromJson(json.asJsonObject.get("baseAddresses"), BaseAddressesDtoBlank::class.java)?.copy()
+            }.getOrNull {
+                mindboxLogE("Failed to parse baseAddresses block in settings section")
+            }
+
+            SettingsDtoBlank(operations, ttl, slidingExpiration, inappSettings, featureToggles, baseAddresses)
+        }
+    }.getOrNull {
+        mindboxLogE("Failed to parse settings block", it)
+    }
+
+    internal fun deserializeAbtests(json: JsonElement?): List<ABTestDto>? = runCatching {
+        json?.asJsonArray?.map { abtest ->
+            gson.fromJson<ABTestDto?>(abtest).getOrThrow()!!
+        }?.map { it.copy() }
+    }.getOrNull {
+        mindboxLogE("Failed to parse abtests block", it)
+    }
+
+    override fun deserializeToInAppFormDto(inAppForm: JsonObject?, inAppId: String): FormDto? {
+        val blankResult = runCatching {
+            gson.fromJson(inAppForm, FormBlankDto::class.java)
+        }
+        blankResult.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, inAppForm, error)
+        }
+        val result =
+            FormDto(
+                variants = blankResult.getOrNull()?.variants?.filterNotNull()
+                    ?.map { payloadBlankDto ->
+                        when (payloadBlankDto) {
+                            is PayloadBlankDto.ModalWindowBlankDto -> {
+                                PayloadDto.ModalWindowDto(
+                                    content = PayloadDto.ModalWindowDto.ContentDto(
+                                        background = BackgroundDto(
+                                            layers = payloadBlankDto.content?.background?.layers?.mapNotNull {
+                                                deserializeToBackgroundLayersDto(it as JsonObject, inAppId)
+                                            }),
+                                        elements = payloadBlankDto.content?.elements?.mapNotNull {
+                                            deserializeToElementDto(it, inAppId)
+                                        }
+                                    ), type = PayloadDto.ModalWindowDto.MODAL_JSON_NAME
+                                )
+                            }
+
+                            is PayloadBlankDto.SnackBarBlankDto -> {
+                                PayloadDto.SnackbarDto(
+                                    content = PayloadDto.SnackbarDto.ContentDto(
+                                        background = BackgroundDto(layers = payloadBlankDto.content?.background?.layers?.mapNotNull {
+                                            deserializeToBackgroundLayersDto(it as JsonObject, inAppId)
+                                        }),
+                                        elements = payloadBlankDto.content?.elements?.mapNotNull {
+                                            deserializeToElementDto(it, inAppId)
+                                        },
+                                        position = PayloadDto.SnackbarDto.ContentDto.PositionDto(
+                                            gravity = PayloadDto.SnackbarDto.ContentDto.PositionDto.GravityDto(
+                                                horizontal = payloadBlankDto.content?.position?.gravity?.horizontal,
+                                                vertical = payloadBlankDto.content?.position?.gravity?.vertical
+                                            ),
+                                            margin = PayloadDto.SnackbarDto.ContentDto.PositionDto.MarginDto(
+                                                bottom = payloadBlankDto.content?.position?.margin?.bottom,
+                                                kind = payloadBlankDto.content?.position?.margin?.kind,
+                                                left = payloadBlankDto.content?.position?.margin?.left,
+                                                right = payloadBlankDto.content?.position?.margin?.right,
+                                                top = payloadBlankDto.content?.position?.margin?.top
+                                            )
+                                        )
+                                    ), type = PayloadDto.SnackbarDto.SNACKBAR_JSON_NAME
+                                )
+                            }
+
+                            is PayloadBlankDto.EmbeddedBlankDto -> {
+                                PayloadDto.EmbeddedDto(
+                                    content = PayloadDto.EmbeddedDto.ContentDto(
+                                        background = BackgroundDto(
+                                            layers = payloadBlankDto.content?.background?.layers?.mapNotNull {
+                                                deserializeToBackgroundLayersDto(it as JsonObject, inAppId)
+                                            })
+                                    ),
+                                    placeSystemName = payloadBlankDto.placeSystemName,
+                                    type = PayloadDto.EmbeddedDto.EMBEDDED_JSON_NAME
+                                )
+                            }
+                        }
+                    })
+        if (result.variants.isNullOrEmpty()) return null
+        return result
+    }
+
+    private fun deserializeToElementDto(element: JsonObject?, inAppId: String): ElementDto? {
+        if (element == null) return null
+        val result = runCatching {
+            gson.fromJson(element, ElementDto::class.java)
+        }
+        result.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, element, error)
+        }
+        return result.getOrNull()
+    }
+
+    private fun deserializeToBackgroundLayersDto(layer: JsonObject?, inAppId: String): BackgroundDto.LayerDto? {
+        if (layer == null) return null
+        val result = runCatching {
+            gson.fromJson(layer, BackgroundDto.LayerDto::class.java)
+        }
+        result.exceptionOrNull()?.let { error ->
+            logParseFailure(inAppId, layer, error)
+        }
+        return result.getOrNull()
+    }
+
+    private fun logParseFailure(inAppId: String, json: JsonElement?, error: Throwable) {
+        if (error is UnknownSubtypeException) {
+            mindboxLogW("In-app $inAppId: unknown ${Constants.TYPE_JSON_NAME} '${error.label}', skipping it: $json")
+        } else {
+            mindboxLogE("Failed to parse JsonObject for in-app $inAppId: $json", error)
+        }
+    }
+}

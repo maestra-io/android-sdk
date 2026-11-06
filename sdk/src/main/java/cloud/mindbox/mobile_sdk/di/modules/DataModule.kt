@@ -1,0 +1,533 @@
+package cloud.mindbox.mobile_sdk.di.modules
+
+import androidx.lifecycle.ProcessLifecycleOwner
+import cloud.mindbox.mobile_sdk.annotations.InternalMindboxApi
+import cloud.mindbox.mobile_sdk.inapp.data.checkers.MaxInappsPerDayLimitChecker
+import cloud.mindbox.mobile_sdk.inapp.data.checkers.MaxInappsPerSessionLimitChecker
+import cloud.mindbox.mobile_sdk.inapp.data.checkers.MinIntervalBetweenShowsLimitChecker
+import cloud.mindbox.mobile_sdk.inapp.data.dto.BackgroundDto
+import cloud.mindbox.mobile_sdk.inapp.data.dto.ElementDto
+import cloud.mindbox.mobile_sdk.inapp.data.dto.PayloadBlankDto
+import cloud.mindbox.mobile_sdk.inapp.data.dto.PayloadDto
+import cloud.mindbox.mobile_sdk.inapp.data.managers.*
+import cloud.mindbox.mobile_sdk.inapp.data.managers.data_filler.*
+import cloud.mindbox.mobile_sdk.inapp.data.mapper.InAppMapper
+import cloud.mindbox.mobile_sdk.inapp.data.repositories.*
+import cloud.mindbox.mobile_sdk.inapp.data.validators.*
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.InAppContentFetcher
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.InAppImageLoader
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.InAppImageSizeStorage
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.PermissionManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.checkers.Checker
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.FeatureToggleManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.GeoSerializationManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppFailureTracker
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.ShowBudgetManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppSerializationManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.MobileConfigSerializationManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.*
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.validators.InAppValidator
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppMessageDelayedManager
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewCachePolicy
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewPrewarmManager
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppWebViewPrewarmManagerImpl
+import cloud.mindbox.mobile_sdk.inapp.presentation.MindboxNotificationManager
+import cloud.mindbox.mobile_sdk.inapp.presentation.MindboxNotificationManagerImpl
+import cloud.mindbox.mobile_sdk.inapp.presentation.view.BridgeMessage
+import cloud.mindbox.mobile_sdk.inapp.webview.InAppWebViewPrewarmEngine
+import cloud.mindbox.mobile_sdk.logger.mindboxLogI
+import cloud.mindbox.mobile_sdk.managers.*
+import cloud.mindbox.mobile_sdk.managers.TrackingIdsResolver
+import cloud.mindbox.mobile_sdk.managers.TrackingIdsResolverImpl
+import cloud.mindbox.mobile_sdk.managers.MobileConfigSettingsManagerImpl
+import cloud.mindbox.mobile_sdk.managers.RequestPermissionManager
+import cloud.mindbox.mobile_sdk.managers.RequestPermissionManagerImpl
+import cloud.mindbox.mobile_sdk.models.TreeTargetingDto
+import cloud.mindbox.mobile_sdk.models.operation.response.DisplayConditionsDto
+import cloud.mindbox.mobile_sdk.models.operation.response.FrequencyDto
+import cloud.mindbox.mobile_sdk.monitoring.data.validators.MonitoringValidator
+import cloud.mindbox.mobile_sdk.utils.*
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import kotlinx.coroutines.Dispatchers
+
+@OptIn(InternalMindboxApi::class)
+internal fun DataModule(
+    appContextModule: AppContextModule,
+    apiModule: ApiModule
+): DataModule = object : DataModule,
+    AppContextModule by appContextModule,
+    ApiModule by apiModule {
+
+    override val inAppImageLoader: InAppImageLoader
+        get() = InAppGlideImageLoaderImpl(
+            appContext,
+            inAppImageSizeStorage
+        )
+
+    override val modalElementDtoDataFiller: ModalElementDtoDataFiller
+        get() = ModalElementDtoDataFiller(closeButtonModalElementDtoDataFiller = closeButtonModalElementDtoDataFiller)
+
+    override val modalWindowValidator: ModalWindowValidator by lazy {
+        ModalWindowValidator(
+            imageLayerValidator = imageLayerValidator,
+            webViewLayerValidator = webViewLayerValidator,
+            elementValidator = modalElementValidator
+        )
+    }
+    override val imageLayerValidator: ImageLayerValidator
+        get() = ImageLayerValidator()
+    override val webViewLayerValidator: WebViewLayerValidator
+        get() = WebViewLayerValidator()
+
+    override val modalElementValidator: ModalElementValidator by lazy {
+        ModalElementValidator(
+            closeButtonElementValidator = closeButtonModalElementValidator
+        )
+    }
+
+    override val snackbarValidator: SnackbarValidator by lazy {
+        SnackbarValidator(
+            imageLayerValidator,
+            snackbarElementValidator
+        )
+    }
+    override val closeButtonModalElementValidator: CloseButtonModalElementValidator
+        get() = CloseButtonModalElementValidator(
+            sizeValidator = CloseButtonModalSizeValidator(),
+            positionValidator = CloseButtonModalPositionValidator()
+        )
+    override val closeButtonModalPositionValidator: CloseButtonModalPositionValidator
+        get() = CloseButtonModalPositionValidator()
+    override val closeButtonSnackbarElementValidator: CloseButtonSnackbarElementValidator
+        get() = CloseButtonSnackbarElementValidator(
+            positionValidator = closeButtonSnackbarPositionValidator,
+            sizeValidator = closeButtonSnackbarSizeValidator
+        )
+    override val closeButtonSnackbarPositionValidator: CloseButtonSnackbarPositionValidator
+        get() = CloseButtonSnackbarPositionValidator()
+    override val closeButtonSnackbarSizeValidator: CloseButtonSnackbarSizeValidator
+        get() = CloseButtonSnackbarSizeValidator()
+    override val closeButtonModalElementDtoDataFiller: CloseButtonModalElementDtoDataFiller
+        get() = CloseButtonModalElementDtoDataFiller()
+    override val closeButtonPositionValidator: CloseButtonModalPositionValidator
+        get() = CloseButtonModalPositionValidator()
+    override val closeButtonModalSizeValidator: CloseButtonModalSizeValidator
+        get() = CloseButtonModalSizeValidator()
+
+    override val snackbarElementValidator: SnackBarElementValidator by lazy {
+        SnackBarElementValidator(
+            closeButtonElementValidator = CloseButtonSnackbarElementValidator(
+                positionValidator = CloseButtonSnackbarPositionValidator(),
+                sizeValidator = CloseButtonSnackbarSizeValidator()
+            )
+        )
+    }
+    override val snackBarElementDtoDataFiller: SnackbarElementDtoDataFiller
+        get() = SnackbarElementDtoDataFiller(closeButtonSnackbarElementDtoDataFiller = closeButtonSnackbarElementDtoDataFiller)
+    override val closeButtonSnackbarElementDtoDataFiller: CloseButtonSnackbarElementDtoDataFiller
+        get() = CloseButtonSnackbarElementDtoDataFiller()
+
+    override val modalWindowDtoDataFiller: ModalWindowDtoDataFiller
+        by lazy { ModalWindowDtoDataFiller(elementDtoDataFiller = modalElementDtoDataFiller) }
+
+    override val snackBarDtoDataFiller: SnackBarDtoDataFiller
+        by lazy { SnackBarDtoDataFiller(elementDtoDataFiller = snackBarElementDtoDataFiller) }
+
+    override val defaultDataManager: DataManager by lazy {
+        DataManager(
+            modalWindowDtoDataFiller = modalWindowDtoDataFiller,
+            snackBarDtoDataFiller = snackBarDtoDataFiller,
+            frequencyDataFiller = frequencyDataFiller
+        )
+    }
+
+    override val inAppImageSizeStorage: InAppImageSizeStorage by lazy { InAppImageSizeStorageImpl() }
+
+    override val sessionStorageManager: SessionStorageManager by lazy { SessionStorageManager(timeProvider) }
+
+    override val permissionManager: PermissionManager
+        get() = PermissionManagerImpl(appContext)
+
+    override val inAppContentFetcher: InAppContentFetcher by lazy {
+        InAppContentFetcherImpl(
+            inAppImageLoader
+        )
+    }
+
+    override val webViewCachePolicy: InAppWebViewCachePolicy by lazy {
+        InAppWebViewCachePolicy(mobileConfigSerializationManager)
+    }
+
+    override val inAppWebViewPrewarmManager: InAppWebViewPrewarmManager by lazy {
+        InAppWebViewPrewarmManagerImpl(
+            engine = InAppWebViewPrewarmEngine(
+                appContext = appContext,
+                log = { message -> mindboxLogI("[WebView] Prewarm: $message") },
+                isCacheEnabled = { webViewCachePolicy.isCacheEnabled }
+            ),
+            mobileConfigSerializationManager = mobileConfigSerializationManager,
+            // Lazy on purpose: this service is resolved on the main thread during SDK init
+            // (prewarm stage 1), and constructing GatewayManager spins up Volley (thread
+            // pool + cache-dir I/O) — defer that to the background fetch that needs it.
+            gatewayManager = lazy { gatewayManager },
+            inAppValidator = inAppValidator,
+            webViewLayerValidator = webViewLayerValidator,
+            learnedHostsStore = InAppWebViewLearnedHostsStore(),
+            featureToggleManager = featureToggleManager,
+            webViewCachePolicy = webViewCachePolicy,
+            processLifecycleState = ProcessLifecycleOwner.get().lifecycle.currentStateFlow
+        )
+    }
+
+    override val mobileConfigRepository: MobileConfigRepository
+        get() = mobileConfigRepositoryLazy.value
+
+    override val mobileConfigRepositoryIfCreated: MobileConfigRepository?
+        get() = mobileConfigRepositoryLazy.takeIf { repository -> repository.isInitialized() }?.value
+
+    private val mobileConfigRepositoryLazy = lazy {
+        MobileConfigRepositoryImpl(
+            inAppMapper = inAppMapper,
+            mobileConfigSerializationManager = mobileConfigSerializationManager,
+            inAppValidator = inAppValidator,
+            abTestValidator = abTestValidator,
+            monitoringValidator = monitoringValidator,
+            operationNameValidator = operationNameValidator,
+            operationValidator = operationValidator,
+            gatewayManager = gatewayManager,
+            defaultDataManager = defaultDataManager,
+            ttlParametersValidator = ttlParametersValidator,
+            inAppConfigTtlValidator = inAppConfigTtlValidator,
+            sessionStorageManager = sessionStorageManager,
+            timeSpanPositiveValidator = slidingExpirationParametersValidator,
+            mobileConfigSettingsManager = mobileConfigSettingsManager,
+            integerPositiveValidator = integerPositiveValidator,
+            inappSettingsManager = inappSettingsManager,
+            featureToggleManager = featureToggleManager,
+            inAppWebViewPrewarmManager = inAppWebViewPrewarmManager
+        )
+    }
+
+    override val mobileConfigSerializationManager: MobileConfigSerializationManager
+        get() = MobileConfigSerializationManagerImpl(
+            gson = gson.newBuilder()
+                .registerTypeAdapter(String::class.java, StrictStringAdapter())
+                .create()
+        )
+
+    override val inAppGeoRepository: InAppGeoRepository by lazy {
+        InAppGeoRepositoryImpl(
+            context = appContext,
+            inAppMapper = inAppMapper,
+            geoSerializationManager = geoSerializationManager,
+            sessionStorageManager = sessionStorageManager,
+            gatewayManager = gatewayManager,
+        )
+    }
+
+    override val inAppRepository: InAppRepository by lazy {
+        InAppRepositoryImpl(
+            context = appContext,
+            sessionStorageManager = sessionStorageManager,
+            inAppSerializationManager = inAppSerializationManager,
+            timeProvider = timeProvider
+        )
+    }
+    override val callbackRepository: CallbackRepository by lazy {
+        CallbackRepositoryImpl(
+            xmlValidator = xmlValidator,
+            jsonValidator = jsonValidator,
+            urlValidator = urlValidator
+        )
+    }
+
+    override val geoSerializationManager: GeoSerializationManager
+        get() = GeoSerializationManagerImpl(gson = gson)
+
+    override val inAppSerializationManager: InAppSerializationManager
+        get() = InAppSerializationManagerImpl(gson = gson)
+
+    override val inAppFailureTracker: InAppFailureTracker by lazy {
+        InAppFailureTrackerImpl(
+            timeProvider = timeProvider,
+            inAppRepository = inAppRepository,
+            featureToggleManager = featureToggleManager,
+            sessionStorageManager = sessionStorageManager,
+        )
+    }
+
+    override val inAppSegmentationRepository: InAppSegmentationRepository by lazy {
+        InAppSegmentationRepositoryImpl(
+            inAppMapper = inAppMapper,
+            sessionStorageManager = sessionStorageManager,
+            gatewayManager = gatewayManager,
+        )
+    }
+    override val inAppTargetingErrorRepository: InAppTargetingErrorRepository by lazy {
+        InAppTargetingErrorRepositoryImpl(
+            sessionStorageManager = sessionStorageManager
+        )
+    }
+
+    override val monitoringValidator: MonitoringValidator by lazy { MonitoringValidator() }
+
+    override val inAppValidator: InAppValidator by lazy {
+        InAppValidatorImpl(
+            sdkVersionValidator = sdkVersionValidator,
+            modalWindowValidator = modalWindowValidator,
+            snackbarValidator = snackbarValidator,
+            frequencyValidator = frequencyValidator,
+            embeddedVariantValidator = embeddedVariantValidator
+        )
+    }
+
+    override val embeddedVariantValidator: EmbeddedVariantValidator
+        get() = EmbeddedVariantValidator(webViewLayerValidator = webViewLayerValidator)
+
+    override val abTestValidator: ABTestValidator by lazy { ABTestValidator(sdkVersionValidator) }
+
+    override val sdkVersionValidator: SdkVersionValidator by lazy { SdkVersionValidator() }
+    override val jsonValidator: JsonValidator by lazy { JsonValidator() }
+    override val xmlValidator: XmlValidator by lazy { XmlValidator() }
+    override val urlValidator: UrlValidator by lazy { UrlValidator() }
+    override val hapticRequestValidator: HapticRequestValidator by lazy { HapticRequestValidator() }
+
+    override val operationNameValidator: OperationNameValidator
+        get() = OperationNameValidator()
+
+    override val operationValidator: OperationValidator
+        get() = OperationValidator()
+
+    override val ttlParametersValidator: TtlParametersValidator by lazy { TtlParametersValidator() }
+
+    override val inAppConfigTtlValidator: InAppConfigTtlValidator by lazy { InAppConfigTtlValidator() }
+
+    override val slidingExpirationParametersValidator: TimeSpanPositiveValidator by lazy { TimeSpanPositiveValidator() }
+    override val mobileConfigSettingsManager: MobileConfigSettingsManagerImpl by lazy {
+        MobileConfigSettingsManagerImpl(
+            appContext,
+            sessionStorageManager,
+            timeProvider,
+            trackingIdsResolver,
+        )
+    }
+    override val trackingIdsResolver: TrackingIdsResolver by lazy {
+        TrackingIdsResolverImpl()
+    }
+    override val integerPositiveValidator: IntegerPositiveValidator by lazy { IntegerPositiveValidator() }
+    override val inappSettingsManager: InappSettingsManagerImpl by lazy { InappSettingsManagerImpl(sessionStorageManager) }
+    override val featureToggleManager: FeatureToggleManager by lazy { FeatureToggleManagerImpl() }
+    override val maxInappsPerSessionLimitChecker: Checker by lazy { MaxInappsPerSessionLimitChecker(sessionStorageManager) }
+    override val maxInappsPerDayLimitChecker: Checker by lazy { MaxInappsPerDayLimitChecker(inAppRepository, sessionStorageManager, timeProvider) }
+    override val minIntervalBetweenShowsLimitChecker: Checker by lazy { MinIntervalBetweenShowsLimitChecker(sessionStorageManager, inAppRepository, timeProvider) }
+    override val showBudgetManager: ShowBudgetManager by lazy {
+        ShowBudgetManagerImpl(
+            sessionStorageManager,
+            inAppRepository,
+            timeProvider,
+            maxInappsPerSessionLimitChecker,
+            maxInappsPerDayLimitChecker,
+            minIntervalBetweenShowsLimitChecker
+        )
+    }
+    override val inAppMessageDelayedManager: InAppMessageDelayedManager by lazy {
+        InAppMessageDelayedManager(timeProvider = timeProvider, dispatcher = Dispatchers.Default)
+    }
+
+    override val inAppMapper: InAppMapper by lazy { InAppMapper() }
+
+    override val mindboxNotificationManager: MindboxNotificationManager by lazy {
+        MindboxNotificationManagerImpl(
+            context = appContext,
+            requestPermissionManager = requestPermissionManager
+        )
+    }
+
+    override val requestPermissionManager: RequestPermissionManager
+        get() = RequestPermissionManagerImpl()
+    override val frequencyDataFiller: FrequencyDataFiller
+        get() = FrequencyDataFiller()
+    override val frequencyValidator: FrequencyValidator
+        get() = FrequencyValidator()
+    override val migrationManager: MigrationManager by lazy {
+        MigrationManager(appContext)
+    }
+    override val timeProvider: SystemTimeProvider by lazy {
+        SystemTimeProvider()
+    }
+
+    override val gson: Gson by lazy {
+        GsonBuilder()
+            .registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        BridgeMessage::class.java,
+                        BridgeMessage.TYPE_FIELD_NAME,
+                        true
+                    ).registerSubtype(
+                        BridgeMessage.Request::class.java,
+                        BridgeMessage.TYPE_REQUEST
+                    ).registerSubtype(
+                        BridgeMessage.Response::class.java,
+                        BridgeMessage.TYPE_RESPONSE
+                    ).registerSubtype(
+                        BridgeMessage.Error::class.java,
+                        BridgeMessage.TYPE_ERROR
+                    )
+            )
+            .registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        FrequencyDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        FrequencyDto.FrequencyOnceDto::class.java,
+                        FrequencyDto.FrequencyOnceDto.FREQUENCY_ONCE_JSON_NAME
+                    ).registerSubtype(
+                        FrequencyDto.FrequencyPeriodicDto::class.java,
+                        FrequencyDto.FrequencyPeriodicDto.FREQUENCY_PERIODIC_JSON_NAME
+                    ).registerSubtype(
+                        FrequencyDto.FrequencyUnlimitedDto::class.java,
+                        FrequencyDto.FrequencyUnlimitedDto.FREQUENCY_UNLIMITED_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        DisplayConditionsDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        DisplayConditionsDto.DirectCallDto::class.java,
+                        DisplayConditionsDto.DirectCallDto.DIRECT_CALL_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        PayloadBlankDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        PayloadBlankDto.ModalWindowBlankDto::class.java,
+                        PayloadDto.ModalWindowDto.MODAL_JSON_NAME
+                    ).registerSubtype(
+                        PayloadBlankDto.SnackBarBlankDto::class.java,
+                        PayloadDto.SnackbarDto.SNACKBAR_JSON_NAME
+                    ).registerSubtype(
+                        PayloadBlankDto.EmbeddedBlankDto::class.java,
+                        PayloadDto.EmbeddedDto.EMBEDDED_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        ElementDto::class.java,
+                        Constants.TYPE_JSON_NAME, true
+                    ).registerSubtype(
+                        ElementDto.CloseButtonElementDto::class.java,
+                        ElementDto.CloseButtonElementDto.CLOSE_BUTTON_ELEMENT_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        BackgroundDto.LayerDto.ImageLayerDto.SourceDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        BackgroundDto.LayerDto.ImageLayerDto.SourceDto.UrlSourceDto::class.java,
+                        BackgroundDto.LayerDto.ImageLayerDto.SourceDto.UrlSourceDto.URL_SOURCE_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        BackgroundDto.LayerDto.ImageLayerDto.ActionDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        RedirectUrlActionDto::class.java,
+                        RedirectUrlActionDto.REDIRECT_URL_ACTION_TYPE_JSON_NAME
+                    ).registerSubtype(
+                        PushPermissionActionDto::class.java,
+                        PushPermissionActionDto.PUSH_PERMISSION_TYPE_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        BackgroundDto.LayerDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        BackgroundDto.LayerDto.ImageLayerDto::class.java,
+                        BackgroundDto.LayerDto.ImageLayerDto.IMAGE_TYPE_JSON_NAME
+                    ).registerSubtype(
+                        BackgroundDto.LayerDto.WebViewLayerDto::class.java,
+                        BackgroundDto.LayerDto.WebViewLayerDto.WEBVIEW_TYPE_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        PayloadDto::class.java,
+                        Constants.TYPE_JSON_NAME, true
+                    ).registerSubtype(
+                        PayloadDto.ModalWindowDto::class.java,
+                        PayloadDto.ModalWindowDto.MODAL_JSON_NAME
+                    ).registerSubtype(
+                        PayloadDto.SnackbarDto::class.java,
+                        PayloadDto.SnackbarDto.SNACKBAR_JSON_NAME
+                    ).registerSubtype(
+                        PayloadDto.EmbeddedDto::class.java,
+                        PayloadDto.EmbeddedDto.EMBEDDED_JSON_NAME
+                    )
+            ).registerTypeAdapterFactory(
+                RuntimeTypeAdapterFactory
+                    .of(
+                        TreeTargetingDto::class.java,
+                        Constants.TYPE_JSON_NAME,
+                        true
+                    ).registerSubtype(
+                        TreeTargetingDto.TrueNodeDto::class.java,
+                        TreeTargetingDto.TrueNodeDto.TRUE_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.IntersectionNodeDto::class.java,
+                        TreeTargetingDto.IntersectionNodeDto.AND_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.UnionNodeDto::class.java,
+                        TreeTargetingDto.UnionNodeDto.OR_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.SegmentNodeDto::class.java,
+                        TreeTargetingDto.SegmentNodeDto.SEGMENT_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.CountryNodeDto::class.java,
+                        TreeTargetingDto.CountryNodeDto.COUNTRY_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.CityNodeDto::class.java,
+                        TreeTargetingDto.CityNodeDto.CITY_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.RegionNodeDto::class.java,
+                        TreeTargetingDto.RegionNodeDto.REGION_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.OperationNodeDto::class.java,
+                        TreeTargetingDto.OperationNodeDto.API_METHOD_CALL_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.ViewProductCategoryNodeDto::class.java,
+                        TreeTargetingDto.ViewProductCategoryNodeDto.VIEW_PRODUCT_CATEGORY_ID_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.ViewProductCategoryInNodeDto::class.java,
+                        TreeTargetingDto.ViewProductCategoryInNodeDto.VIEW_PRODUCT_CATEGORY_ID_IN_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.ViewProductSegmentNodeDto::class.java,
+                        TreeTargetingDto.ViewProductSegmentNodeDto.VIEW_PRODUCT_SEGMENT_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.ViewProductNodeDto::class.java,
+                        TreeTargetingDto.ViewProductNodeDto.VIEW_PRODUCT_ID_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.VisitNodeDto::class.java,
+                        TreeTargetingDto.VisitNodeDto.VISIT_JSON_NAME
+                    ).registerSubtype(
+                        TreeTargetingDto.PushPermissionDto::class.java,
+                        TreeTargetingDto.PushPermissionDto.PUSH_PERMISSION_JSON_NAME
+                    )
+            )
+            .create()
+    }
+}

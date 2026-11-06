@@ -1,0 +1,366 @@
+package cloud.mindbox.mobile_sdk.inapp.domain
+
+import cloud.mindbox.mobile_sdk.Mindbox.logI
+import cloud.mindbox.mobile_sdk.gatedTags
+import cloud.mindbox.mobile_sdk.getErrorResponseBodyData
+import cloud.mindbox.mobile_sdk.getImageUrl
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.asVolleyError
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.getProductFromTargetingData
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.getVolleyErrorDetails
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.shouldTrackImageDownloadError
+import cloud.mindbox.mobile_sdk.inapp.domain.extensions.shouldTrackTargetingError
+import cloud.mindbox.mobile_sdk.inapp.data.managers.SEND_INAPP_TAGS_FEATURE
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.InAppContentFetcher
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.FeatureToggleManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppFailureTracker
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.InAppProcessingManager
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.InAppGeoRepository
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.InAppRepository
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.InAppSegmentationRepository
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.InAppTargetingErrorRepository
+import cloud.mindbox.mobile_sdk.inapp.domain.models.*
+import cloud.mindbox.mobile_sdk.logger.*
+import cloud.mindbox.mobile_sdk.models.InAppEventType
+import cloud.mindbox.mobile_sdk.models.operation.request.FailureReason
+import kotlinx.coroutines.*
+
+internal class InAppProcessingManagerImpl(
+    private val inAppGeoRepository: InAppGeoRepository,
+    private val inAppSegmentationRepository: InAppSegmentationRepository,
+    private val inAppTargetingErrorRepository: InAppTargetingErrorRepository,
+    private val inAppContentFetcher: InAppContentFetcher,
+    private val inAppRepository: InAppRepository,
+    private val inAppFailureTracker: InAppFailureTracker,
+    private val featureToggleManager: FeatureToggleManager
+) : InAppProcessingManager {
+
+    companion object {
+        private const val RESPONSE_STATUS_CUSTOMER_SEGMENTS_REQUIRE_CUSTOMER =
+            "CheckCustomerSegments requires customer"
+    }
+
+    private val requestedTargetingData =
+        TargetingDataWrapper(InAppEventType.EmbeddedPlaceRequested.EVENT_NAME)
+
+    private fun isTagsFeatureEnabled(): Boolean =
+        featureToggleManager.isEnabled(SEND_INAPP_TAGS_FEATURE)
+
+    override suspend fun chooseInAppToShow(
+        inApps: List<InApp>,
+        triggerEvent: InAppEventType,
+        selectVariant: (InApp) -> InAppType?,
+    ): InApp? {
+        for (inApp in inApps) {
+            val variant = selectVariant(inApp)
+            if (variant == null) {
+                mindboxLogD("Skipping inApp with id = ${inApp.id}: no variant this path can render")
+                continue
+            }
+            val data = getTargetingData(triggerEvent)
+            val tags = inApp.gatedTags(isTagsFeatureEnabled())
+            var isTargetingErrorOccurred = false
+            var isInAppContentFetched: Boolean? = null
+            var targetingCheck = false
+            var imageFetchError: Throwable? = null
+            withContext(Dispatchers.IO) {
+                val imageJob =
+                    launch(start = CoroutineStart.LAZY) {
+                        runCatching {
+                            isInAppContentFetched =
+                                inAppContentFetcher.fetchContent(
+                                    inApp.id,
+                                    variant
+                                )
+                        }.onFailure { throwable ->
+                            when (throwable) {
+                                is CancellationException -> {
+                                    inAppContentFetcher.cancelFetching(inApp.id)
+                                    isInAppContentFetched = null
+                                }
+
+                                is InAppContentFetchingError -> {
+                                    isInAppContentFetched = false
+                                    imageFetchError = throwable
+                                }
+                            }
+                        }
+                    }
+                val targetingJob = launch(start = CoroutineStart.LAZY) {
+                    runCatching {
+                        inApp.targeting.fetchTargetingInfo(data)
+                        targetingCheck = inApp.targeting.checkTargeting(data)
+                    }.onFailure { throwable ->
+                        when (throwable) {
+                            is CancellationException -> throw throwable
+
+                            is GeoError -> {
+                                isTargetingErrorOccurred = true
+                                inAppGeoRepository.setGeoStatus(GeoFetchStatus.GEO_FETCH_ERROR)
+                                if (throwable.shouldTrackTargetingError()) {
+                                    inAppTargetingErrorRepository.saveError(
+                                        key = TargetingErrorKey.Geo,
+                                        error = throwable
+                                    )
+                                }
+                                mindboxLogE("Error fetching geo", throwable)
+                            }
+
+                            is CustomerSegmentationError -> {
+                                isTargetingErrorOccurred = true
+                                inAppSegmentationRepository.setCustomerSegmentationStatus(
+                                    CustomerSegmentationFetchStatus.SEGMENTATION_FETCH_ERROR
+                                )
+                                if (throwable.shouldTrackTargetingError()) {
+                                    inAppTargetingErrorRepository.saveError(
+                                        key = TargetingErrorKey.CustomerSegmentation,
+                                        error = throwable
+                                    )
+                                }
+                                handleCustomerSegmentationErrorLog(throwable)
+                            }
+
+                            else -> {
+                                mindboxLogE(throwable.message ?: "", throwable)
+                                inAppFailureTracker.sendFailure(
+                                    inAppId = inApp.id,
+                                    failureReason = FailureReason.UNKNOWN_ERROR,
+                                    errorDetails = "Unknown exception when checking target ${throwable.message}. ${throwable.cause?.getVolleyErrorDetails() ?: "volleyError=null"}",
+                                    tags = tags
+                                )
+                                throw throwable
+                            }
+                        }
+                    }
+                }
+                listOf(imageJob, targetingJob.apply {
+                    invokeOnCompletion {
+                        if (imageJob.isActive && !targetingCheck) {
+                            imageJob.cancel()
+                            mindboxLogD("Cancelling content loading since targeting is $targetingCheck")
+                        }
+                    }
+                }).onEach {
+                    it.start()
+                }.joinAll()
+            }
+            mindboxLogD("loading and targeting fetching finished")
+            if (isTargetingErrorOccurred) return chooseInAppToShow(inApps, triggerEvent, selectVariant)
+            trackTargetingErrorIfAny(inApp, data, tags)
+            if (isInAppContentFetched == false && targetingCheck) {
+                imageFetchError?.takeIf { it.shouldTrackImageDownloadError() }?.let { error ->
+                    inAppFailureTracker.collectFailure(
+                        inAppId = inApp.id,
+                        failureReason = FailureReason.IMAGE_DOWNLOAD_FAILED,
+                        errorDetails = (error.message ?: "Image loading error") + "\n Url is ${variant.getImageUrl()}",
+                        tags = tags
+                    )
+                }
+            }
+            if (isInAppContentFetched == false) {
+                mindboxLogD("Skipping inApp with id = ${inApp.id} due to content fetching error.")
+                continue
+            }
+            mindboxLogD("Check ${inApp.targeting.type}: $targetingCheck")
+            if (!targetingCheck) {
+                mindboxLogD("Skipping inApp with id = ${inApp.id} due to targeting is false")
+            }
+            if (targetingCheck) {
+                inAppFailureTracker.clearFailures()
+                return inApp
+            }
+        }
+        inAppFailureTracker.sendCollectedFailures()
+        return null
+    }
+
+    override suspend fun sendTargetedInApp(inApp: InApp, triggerEvent: InAppEventType) {
+        var isTargetingErrorOccurred = false
+        val data = getTargetingData(triggerEvent)
+        runCatching {
+            inApp.targeting.fetchTargetingInfo(data)
+        }.onFailure { throwable ->
+            when (throwable) {
+                is CancellationException -> throw throwable
+
+                is GeoError -> {
+                    isTargetingErrorOccurred = true
+                    inAppGeoRepository.setGeoStatus(GeoFetchStatus.GEO_FETCH_ERROR)
+                    InAppProcessingManagerImpl.mindboxLogE("Error fetching geo", throwable)
+                }
+
+                is CustomerSegmentationError -> {
+                    isTargetingErrorOccurred = true
+                    inAppSegmentationRepository.setCustomerSegmentationStatus(
+                        CustomerSegmentationFetchStatus.SEGMENTATION_FETCH_ERROR
+                    )
+                    handleCustomerSegmentationErrorLog(throwable)
+                }
+
+                else -> InAppProcessingManagerImpl.mindboxLogE("Error fetching segmentation", throwable)
+            }
+        }
+        if (isTargetingErrorOccurred) return sendTargetedInApp(inApp, triggerEvent)
+        if (inApp.targeting.checkTargeting(data)) {
+            logI("InApp with id = ${inApp.id} sends targeting by event $triggerEvent")
+            inAppRepository.sendUserTargeted(
+                inAppId = inApp.id,
+                tags = inApp.gatedTags(isTagsFeatureEnabled()),
+            )
+        }
+    }
+
+    override fun sendTargetedInApp(inApp: InApp) {
+        logI("InApp with id = ${inApp.id} sends targeting without re-checking: the selection already verified it")
+        inAppRepository.sendUserTargeted(
+            inAppId = inApp.id,
+            tags = inApp.gatedTags(isTagsFeatureEnabled()),
+        )
+    }
+
+    override suspend fun matchesTargeting(inApp: InApp, triggerEvent: InAppEventType): Boolean =
+        matchesTargeting(inApp, getTargetingData(triggerEvent), collectsFailures = true)
+
+    override suspend fun matchesRequestedTargeting(inApp: InApp): Boolean =
+        matchesTargeting(inApp, requestedTargetingData, collectsFailures = false)
+
+    private suspend fun matchesTargeting(inApp: InApp, data: TargetingData, collectsFailures: Boolean): Boolean {
+        val tags = inApp.gatedTags(isTagsFeatureEnabled())
+        var isTargetingErrorOccurred = false
+        var targetingCheck = false
+        runCatching {
+            inApp.targeting.fetchTargetingInfo(data)
+            targetingCheck = inApp.targeting.checkTargeting(data)
+        }.onFailure { throwable ->
+            if (throwable is CancellationException) throw throwable
+            if (handleTargetingFetchError(throwable)) {
+                isTargetingErrorOccurred = true
+            } else {
+                mindboxLogE(throwable.message ?: "", throwable)
+                if (collectsFailures) {
+                    inAppFailureTracker.sendFailure(
+                        inAppId = inApp.id,
+                        failureReason = FailureReason.UNKNOWN_ERROR,
+                        errorDetails = "Unknown exception when checking target ${throwable.message}. ${throwable.cause?.getVolleyErrorDetails() ?: "volleyError=null"}",
+                        tags = tags
+                    )
+                }
+            }
+        }
+        if (isTargetingErrorOccurred) return matchesTargeting(inApp, data, collectsFailures)
+        if (collectsFailures) trackTargetingErrorIfAny(inApp, data, tags)
+        return targetingCheck
+    }
+
+    override suspend fun prefetchTargetingDependencies(inApps: List<InApp>) {
+        val fetchesSegmentations = inAppSegmentationRepository.getCustomerSegmentationFetched() ==
+            CustomerSegmentationFetchStatus.SEGMENTATION_NOT_FETCHED &&
+            inApps.any { inApp -> inApp.targeting.hasSegmentationNode() }
+        val fetchesGeo = inAppGeoRepository.getGeoFetchedStatus() == GeoFetchStatus.GEO_NOT_FETCHED &&
+            inApps.any { inApp -> inApp.targeting.hasGeoNode() }
+        if (!fetchesSegmentations && !fetchesGeo) return
+        mindboxLogI("Prefetching targeting dependencies: segmentations=$fetchesSegmentations, geo=$fetchesGeo")
+        coroutineScope {
+            if (fetchesSegmentations) launch { fetchTargetingDependency { inAppSegmentationRepository.fetchCustomerSegmentations() } }
+            if (fetchesGeo) launch { fetchTargetingDependency { inAppGeoRepository.fetchGeo() } }
+        }
+    }
+
+    private fun handleTargetingFetchError(error: Throwable): Boolean = when (error) {
+        is GeoError -> {
+            if (error.shouldTrackTargetingError()) {
+                inAppTargetingErrorRepository.saveError(key = TargetingErrorKey.Geo, error = error)
+            }
+            mindboxLogE("Error fetching geo", error)
+            true
+        }
+
+        is CustomerSegmentationError -> {
+            if (error.shouldTrackTargetingError()) {
+                inAppTargetingErrorRepository.saveError(key = TargetingErrorKey.CustomerSegmentation, error = error)
+            }
+            handleCustomerSegmentationErrorLog(error)
+            true
+        }
+
+        else -> false
+    }
+
+    private suspend fun fetchTargetingDependency(fetch: suspend () -> Unit) {
+        try {
+            fetch()
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Throwable) {
+            if (!handleTargetingFetchError(error)) mindboxLogE("Error prefetching targeting dependencies", error)
+        }
+    }
+
+    private fun getTargetingData(triggerEvent: InAppEventType): TargetingData {
+        val ordinalEvent = triggerEvent as? InAppEventType.OrdinalEvent
+
+        return TargetingDataWrapper(
+            triggerEvent.name,
+            ordinalEvent?.body
+        )
+    }
+
+    private fun handleCustomerSegmentationErrorLog(error: CustomerSegmentationError) {
+        val volleyError = error.cause.asVolleyError()
+        volleyError?.let {
+            if ((volleyError.networkResponse?.statusCode == 400) && (volleyError.getErrorResponseBodyData()
+                    .contains(RESPONSE_STATUS_CUSTOMER_SEGMENTS_REQUIRE_CUSTOMER))
+            ) {
+                mindboxLogI("Cannot check customer segment. It's a new customer")
+                return
+            }
+        }
+        mindboxLogW("Error fetching customer segmentations", error)
+    }
+
+    private fun trackTargetingErrorIfAny(inApp: InApp, data: TargetingData, tags: Map<String, String>?) {
+        when {
+            inApp.targeting.hasSegmentationNode() &&
+                inAppSegmentationRepository.getCustomerSegmentationFetched() == CustomerSegmentationFetchStatus.SEGMENTATION_FETCH_ERROR -> {
+                inAppTargetingErrorRepository.getError(TargetingErrorKey.CustomerSegmentation)
+                    ?.let { errorDetails ->
+                        inAppFailureTracker.collectFailure(
+                            inAppId = inApp.id,
+                            failureReason = FailureReason.CUSTOMER_SEGMENT_REQUEST_FAILED,
+                            errorDetails = errorDetails,
+                            tags = tags
+                        )
+                    }
+                return
+            }
+
+            inApp.targeting.hasGeoNode() &&
+                inAppGeoRepository.getGeoFetchedStatus() == GeoFetchStatus.GEO_FETCH_ERROR -> {
+                inAppTargetingErrorRepository.getError(TargetingErrorKey.Geo)
+                    ?.let { errorDetails ->
+                        inAppFailureTracker.collectFailure(
+                            inAppId = inApp.id,
+                            failureReason = FailureReason.GEO_TARGETING_FAILED,
+                            errorDetails = errorDetails,
+                            tags = tags
+                        )
+                    }
+                return
+            }
+
+            inApp.targeting.hasProductSegmentationNode() -> {
+                data.getProductFromTargetingData()?.let { product ->
+                    inAppTargetingErrorRepository.getError(
+                        TargetingErrorKey.ProductSegmentation(product)
+                    )?.let { errorDetails ->
+                        inAppFailureTracker.collectFailure(
+                            inAppId = inApp.id,
+                            failureReason = FailureReason.PRODUCT_SEGMENT_REQUEST_FAILED,
+                            errorDetails = errorDetails,
+                            tags = tags
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

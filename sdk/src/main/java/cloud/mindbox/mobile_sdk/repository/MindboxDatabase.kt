@@ -1,0 +1,81 @@
+package cloud.mindbox.mobile_sdk.repository
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.TypeConverters
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import cloud.mindbox.mobile_sdk.converters.MindboxRoomConverter
+import cloud.mindbox.mobile_sdk.data.ConfigurationsDao
+import cloud.mindbox.mobile_sdk.data.EventsDao
+import cloud.mindbox.mobile_sdk.logger.mindboxLogI
+import cloud.mindbox.mobile_sdk.managers.DbManager.CONFIGURATION_TABLE_NAME
+import cloud.mindbox.mobile_sdk.models.Configuration
+import cloud.mindbox.mobile_sdk.models.Event
+
+@Database(entities = [Configuration::class, Event::class], exportSchema = false, version = 4)
+@TypeConverters(MindboxRoomConverter::class)
+internal abstract class MindboxDatabase : RoomDatabase() {
+
+    companion object {
+
+        private const val DATABASE_NAME = "mindbox_db"
+
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val query = "ALTER TABLE $CONFIGURATION_TABLE_NAME " +
+                    "ADD COLUMN shouldCreateCustomer INTEGER NOT NULL DEFAULT 1"
+                db.execSQL(query)
+            }
+        }
+
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE $CONFIGURATION_TABLE_NAME ADD COLUMN operationsDomain TEXT"
+                )
+            }
+        }
+
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+
+            override fun migrate(db: SupportSQLiteDatabase) {
+                mindboxLogI("DB migration 3->4 started")
+                db.execSQL(
+                    "ALTER TABLE $CONFIGURATION_TABLE_NAME " +
+                        "ADD COLUMN shouldIncludeVersionCode INTEGER NOT NULL DEFAULT 1"
+                )
+                mindboxLogI("DB migration 3->4 finished")
+            }
+        }
+
+        internal var isTestMode = false
+
+        internal fun getInstance(context: Context) = if (!isTestMode) {
+            Room
+                .databaseBuilder(
+                    context.applicationContext,
+                    MindboxDatabase::class.java,
+                    DATABASE_NAME,
+                ).addMigrations(
+                    MIGRATION_1_2,
+                    MIGRATION_2_3,
+                    MIGRATION_3_4
+                )
+                .build()
+        } else {
+            Room
+                .inMemoryDatabaseBuilder(context.applicationContext, MindboxDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+        }
+    }
+
+    abstract fun configurationDao(): ConfigurationsDao
+
+    abstract fun eventsDao(): EventsDao
+}

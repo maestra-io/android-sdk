@@ -1,0 +1,410 @@
+package cloud.mindbox.mobile_sdk.inapp.data.managers
+
+import cloud.mindbox.mobile_sdk.inapp.domain.models.CustomerSegmentationFetchStatus
+import cloud.mindbox.mobile_sdk.inapp.domain.models.GeoFetchStatus
+import cloud.mindbox.mobile_sdk.inapp.domain.models.InAppShowLimitsSettings
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.managers.ShowBudgetOwner
+import cloud.mindbox.mobile_sdk.inapp.domain.models.ShowReservation
+import cloud.mindbox.mobile_sdk.inapp.domain.models.ProductSegmentationFetchStatus
+import cloud.mindbox.mobile_sdk.inapp.domain.models.TargetingErrorKey
+import cloud.mindbox.mobile_sdk.models.EventType
+import cloud.mindbox.mobile_sdk.models.InAppEventType
+import cloud.mindbox.mobile_sdk.models.Milliseconds
+import cloud.mindbox.mobile_sdk.models.PlaceKey
+import cloud.mindbox.mobile_sdk.models.SessionEpoch
+import cloud.mindbox.mobile_sdk.models.Timestamp
+import cloud.mindbox.mobile_sdk.models.TrackVisitOrigin
+import cloud.mindbox.mobile_sdk.utils.TimeProvider
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.verify
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
+
+class SessionStorageManagerTest {
+    private lateinit var mockTimeProvider: TimeProvider
+    private lateinit var sessionStorageManager: SessionStorageManager
+
+    private fun setupSessionState(
+        lastTrackTime: Long,
+        sessionTime: Long,
+        currentTime: Long
+    ) {
+        sessionStorageManager.lastTrackVisitSendTime.set(lastTrackTime)
+        sessionStorageManager.state.sessionTime = sessionTime.milliseconds
+        every { mockTimeProvider.currentTimeMillis() } returns currentTime
+    }
+
+    @Before
+    fun setup() {
+        mockTimeProvider = mockk()
+        sessionStorageManager = SessionStorageManager(mockTimeProvider)
+    }
+
+    @Test
+    fun `hasSessionExpired should initialize lastTrackVisitSendTime on first call`() {
+        every { mockTimeProvider.currentTimeMillis() } returns 1000L
+
+        assertEquals(0L, sessionStorageManager.lastTrackVisitSendTime.get())
+        sessionStorageManager.hasSessionExpired()
+        assertEquals(1000L, sessionStorageManager.lastTrackVisitSendTime.get())
+    }
+
+    @Test
+    fun `hasSessionExpired should not check expiration if sessionTime is 0`() {
+        val listener = mockk<() -> Unit>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 0L, currentTime = 2000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        verify(exactly = 0) { listener.invoke() }
+        assertEquals(2000L, sessionStorageManager.lastTrackVisitSendTime.get())
+    }
+
+    @Test
+    fun `hasSessionExpired should notify listeners when session expired`() {
+        val listener = mockk<() -> Unit>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 999L, currentTime = 2000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        verify(exactly = 1) { listener.invoke() }
+    }
+
+    @Test
+    fun `hasSessionExpired should not notify listeners when session is active`() {
+        val listener = mockk<() -> Unit>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 2000L, currentTime = 1500L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        verify(exactly = 0) { listener.invoke() }
+    }
+
+    @Test
+    fun `hasSessionExpired should not notify listeners when session is active in case when sessionTime equals time between visits`() {
+        val listener = mockk<() -> Unit>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 2000L, currentTime = 3000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        verify(exactly = 0) { listener.invoke() }
+    }
+
+    @Test
+    fun `hasSessionExpired should not notify listeners when sessionTime is negative`() {
+        val listener = mockk<() -> Unit>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = -2000L, currentTime = 1500L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertEquals(sessionStorageManager.lastTrackVisitSendTime.get(), 1500L)
+        verify(exactly = 0) { listener.invoke() }
+    }
+
+    @Test
+    fun `every field of the manager is either session state or on the allow-list of what survives a session`() {
+        val survivesSession = setOf(
+            "timeProvider",
+            "state",
+            "showBudgetLock",
+            "sessionEpochs",
+            "isSessionEnding",
+            "isReturnCheckPending",
+            "lastTrackVisitData",
+            "lastTrackVisitSendTime",
+            "sessionExpirationListeners",
+            "wasSessionExpiredOnLastCheck",
+        )
+        val declared = SessionStorageManager::class.java.declaredFields
+            .map { field -> field.name }
+            .filterNot { name -> name.contains('$') }
+            .toSet()
+
+        assertEquals(survivesSession, declared)
+    }
+
+    @Test
+    fun `clearSessionData should reset all fields to default values`() {
+        sessionStorageManager.state.apply {
+            inAppCustomerSegmentations = mockk()
+            unShownOperationalInApps["test"] = mutableListOf(mockk())
+            operationalInApps["test"] = mutableListOf(mockk())
+            inAppMessageShownInSession.add("test1")
+            inAppMessageShownInSession.add("test2")
+            embeddedLastShownByPlace[PlaceKey.of("main-screen-top")] = "in-app-1"
+            embeddedLastTargetedByPlace[PlaceKey.of("main-screen-top")] = "in-app-2"
+            embeddedLastOperationByPlace[PlaceKey.of("main-screen-top")] =
+                InAppEventType.OrdinalEvent(EventType.AsyncOperation("block-operation"))
+            placeTargetingReportedInSession.add("in-app-3")
+            requestedInAppTargetingReportedInSession.add("host|inapp")
+            embeddedDelaysWaitedOut.add("main-screen-top|in-app-1")
+            waitBudgetReportedPlaces.add(PlaceKey.of("main-screen-top"))
+            showReservations[ShowBudgetOwner.Place(PlaceKey.of("main-screen-top"))] = ShowReservation("in-app-1", Timestamp(1L))
+            customerSegmentationFetchStatus = CustomerSegmentationFetchStatus.SEGMENTATION_FETCH_SUCCESS
+            geoFetchStatus = GeoFetchStatus.GEO_FETCH_SUCCESS
+            processedProductSegmentations["testSystem" to "testValue"] = ProductSegmentationFetchStatus.SEGMENTATION_FETCH_SUCCESS
+            inAppProductSegmentations["testSystem" to "testValue"] = setOf(mockk())
+            currentSessionInApps = listOf(mockk())
+            shownInAppIdsWithEvents["event"] = mutableSetOf(1, 2, 3)
+            configFetchingError = true
+            sessionTime = 1000L.milliseconds
+            inAppShowLimitsSettings = InAppShowLimitsSettings(maxInappsPerSession = 20, maxInappsPerDay = 20, minIntervalBetweenShows = Milliseconds(100))
+            lastTargetingErrors[TargetingErrorKey.CustomerSegmentation] = "error in customer segment"
+            lastTargetingErrors[TargetingErrorKey.Geo] = "error in geo"
+            lastTargetingErrors[TargetingErrorKey.ProductSegmentation(Pair("product", "45"))] = "error in product segment"
+        }
+
+        sessionStorageManager.clearSessionData()
+
+        assertNull(sessionStorageManager.state.inAppCustomerSegmentations)
+        assertTrue(sessionStorageManager.state.unShownOperationalInApps.isEmpty())
+        assertTrue(sessionStorageManager.state.operationalInApps.isEmpty())
+        assertTrue(sessionStorageManager.state.inAppMessageShownInSession.isEmpty())
+        assertTrue(sessionStorageManager.state.embeddedLastShownByPlace.isEmpty())
+        assertTrue(sessionStorageManager.state.embeddedLastTargetedByPlace.isEmpty())
+        assertTrue(sessionStorageManager.state.embeddedLastOperationByPlace.isEmpty())
+        assertTrue(sessionStorageManager.state.placeTargetingReportedInSession.isEmpty())
+        assertTrue(sessionStorageManager.state.requestedInAppTargetingReportedInSession.isEmpty())
+        assertTrue(sessionStorageManager.state.embeddedDelaysWaitedOut.isEmpty())
+        assertTrue(sessionStorageManager.state.waitBudgetReportedPlaces.isEmpty())
+        assertTrue(sessionStorageManager.state.showReservations.isEmpty())
+        assertEquals(CustomerSegmentationFetchStatus.SEGMENTATION_NOT_FETCHED, sessionStorageManager.state.customerSegmentationFetchStatus)
+        assertEquals(GeoFetchStatus.GEO_NOT_FETCHED, sessionStorageManager.state.geoFetchStatus)
+        assertTrue(sessionStorageManager.state.processedProductSegmentations.isEmpty())
+        assertTrue(sessionStorageManager.state.inAppProductSegmentations.isEmpty())
+        assertTrue(sessionStorageManager.state.currentSessionInApps.isEmpty())
+        assertTrue(sessionStorageManager.state.shownInAppIdsWithEvents.isEmpty())
+        assertFalse(sessionStorageManager.state.configFetchingError)
+        assertEquals(0L, sessionStorageManager.state.sessionTime.inWholeMilliseconds)
+        assertEquals(InAppShowLimitsSettings(), sessionStorageManager.state.inAppShowLimitsSettings)
+        assertTrue(sessionStorageManager.state.lastTargetingErrors.isEmpty())
+    }
+
+    @Test
+    fun `a session reset keeps the last visit's source for the pages of the new session`() {
+        val visit = TrackVisitOrigin(
+            source = "link",
+            requestUrl = "https://example.com/promo",
+        )
+        sessionStorageManager.lastTrackVisitData = visit
+
+        sessionStorageManager.clearSessionData()
+
+        assertSame(visit, sessionStorageManager.lastTrackVisitData)
+    }
+
+    @Test
+    fun `a visit without a source of its own keeps the source of the previous visit for the pages`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 0L, currentTime = 2000L)
+
+        sessionStorageManager.onTrackVisit("link", "https://example.com/promo")
+        sessionStorageManager.onTrackVisit(null, null)
+
+        assertEquals(TrackVisitOrigin(source = "link", requestUrl = "https://example.com/promo"), sessionStorageManager.lastTrackVisitData)
+    }
+
+    @Test
+    fun `check inAppMessageShownInSession elements count`() {
+        val inAppId1 = "inApp1"
+        val inAppId2 = "inApp2"
+        val expectedResult = 3
+        assertTrue(sessionStorageManager.state.inAppMessageShownInSession.isEmpty())
+
+        sessionStorageManager.state.inAppMessageShownInSession.add(inAppId1)
+        sessionStorageManager.state.inAppMessageShownInSession.add(inAppId2)
+        sessionStorageManager.state.inAppMessageShownInSession.add(inAppId1)
+
+        assertEquals(expectedResult, sessionStorageManager.state.inAppMessageShownInSession.size)
+    }
+
+    @Test
+    fun `isSessionExpiredOnLastCheck returns true when session has expired`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 500L, currentTime = 2000L) // 1000 > 500
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertTrue(sessionStorageManager.isSessionExpiredOnLastCheck())
+    }
+
+    @Test
+    fun `isSessionExpiredOnLastCheck returns false when session is active`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 2000L, currentTime = 1500L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertFalse(sessionStorageManager.isSessionExpiredOnLastCheck())
+    }
+
+    @Test
+    fun `isSessionExpiredOnLastCheck returns false on first sdk track visit`() {
+        setupSessionState(lastTrackTime = 0L, sessionTime = 1000L, currentTime = 2000L)
+        sessionStorageManager.hasSessionExpired()
+
+        assertFalse(sessionStorageManager.isSessionExpiredOnLastCheck())
+    }
+
+    @Test
+    fun `isSessionExpiredOnLastCheck returns false when sessionTime is zero`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 0L, currentTime = 2000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertFalse(sessionStorageManager.isSessionExpiredOnLastCheck())
+    }
+
+    @Test
+    fun `isSessionExpiredOnLastCheck should be reset to true on a subsequent valid check`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 500L, currentTime = 2000L)
+        sessionStorageManager.hasSessionExpired()
+        assertTrue(sessionStorageManager.isSessionExpiredOnLastCheck())
+
+        every { mockTimeProvider.currentTimeMillis() } returns 2500L
+        sessionStorageManager.hasSessionExpired()
+        assertFalse(sessionStorageManager.isSessionExpiredOnLastCheck())
+
+        every { mockTimeProvider.currentTimeMillis() } returns 3001L
+        sessionStorageManager.hasSessionExpired()
+        assertTrue(sessionStorageManager.isSessionExpiredOnLastCheck())
+    }
+
+    @Test
+    fun `hasSessionExpired should not have race conditions on lastTrackVisitSendTime`() {
+        val listener = mockk<() -> Unit>()
+        val threads = mutableListOf<Thread>()
+        sessionStorageManager.addSessionExpirationListener(listener)
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 999L, currentTime = 2000L)
+
+        repeat(5) {
+            threads.add(Thread {
+                sessionStorageManager.hasSessionExpired()
+            })
+        }
+
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+
+        verify(exactly = 1) { listener.invoke() }
+    }
+
+    @Test
+    fun `clearSessionData moves the session epoch on with every new session`() {
+        assertEquals(SessionEpoch(0L), sessionStorageManager.sessionEpoch)
+
+        sessionStorageManager.clearSessionData()
+        sessionStorageManager.clearSessionData()
+
+        assertEquals(SessionEpoch(2L), sessionStorageManager.sessionEpoch)
+    }
+
+    @Test
+    fun `the session epoch moves with the state only once the show budget lock is free`() {
+        val previousState = sessionStorageManager.state
+        val worker = Executors.newSingleThreadExecutor()
+        val reset = synchronized(sessionStorageManager.showBudgetLock) {
+            val reset = worker.submit { sessionStorageManager.clearSessionData() }
+            Thread.sleep(150)
+            assertEquals(SessionEpoch(0L), sessionStorageManager.sessionEpoch)
+            assertSame(previousState, sessionStorageManager.state)
+            reset
+        }
+
+        reset.get(5, TimeUnit.SECONDS)
+
+        assertEquals(SessionEpoch(1L), sessionStorageManager.sessionEpoch)
+        assertNotSame(previousState, sessionStorageManager.state)
+        worker.shutdown()
+    }
+
+    @Test
+    fun `a session found expired is ending before its listeners hear of it and until its data is wiped`() {
+        var wasEndingWhenNotified = false
+        sessionStorageManager.addSessionExpirationListener { wasEndingWhenNotified = sessionStorageManager.isSessionEnding }
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 500L, currentTime = 2000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertTrue(wasEndingWhenNotified)
+        assertTrue(sessionStorageManager.isSessionEnding)
+
+        sessionStorageManager.clearSessionData()
+
+        assertFalse(sessionStorageManager.isSessionEnding)
+    }
+
+    @Test
+    fun `a session check reads the last visit and marks the session ending under the show budget lock`() {
+        sessionStorageManager.addSessionExpirationListener {}
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 500L, currentTime = 2000L)
+        val worker = Executors.newSingleThreadExecutor()
+        val check = synchronized(sessionStorageManager.showBudgetLock) {
+            val check = worker.submit { sessionStorageManager.hasSessionExpired() }
+            Thread.sleep(150)
+            assertEquals(1000L, sessionStorageManager.lastTrackVisitSendTime.get())
+            assertFalse(sessionStorageManager.isSessionEnding)
+            check
+        }
+
+        check.get(5, TimeUnit.SECONDS)
+
+        assertEquals(2000L, sessionStorageManager.lastTrackVisitSendTime.get())
+        assertTrue(sessionStorageManager.isSessionEnding)
+        worker.shutdown()
+    }
+
+    @Test
+    fun `a session check that finds the session active ends nothing`() {
+        sessionStorageManager.addSessionExpirationListener {}
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 2000L, currentTime = 1500L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertFalse(sessionStorageManager.isSessionEnding)
+    }
+
+    @Test
+    fun `a session found expired with nothing listening to start the next one does not count as ending`() {
+        setupSessionState(lastTrackTime = 1000L, sessionTime = 500L, currentTime = 2000L)
+
+        sessionStorageManager.hasSessionExpired()
+
+        assertFalse(sessionStorageManager.isSessionEnding)
+    }
+
+    @Test
+    fun `the session check of a return is waited for only while the app is away`() = runBlocking {
+        assertNotNull(withTimeoutOrNull(1_000L) { sessionStorageManager.awaitReturnChecked() })
+
+        sessionStorageManager.onAppLeftForeground()
+
+        assertNull(withTimeoutOrNull(100L) { sessionStorageManager.awaitReturnChecked() })
+
+        sessionStorageManager.onReturnChecked()
+
+        assertNotNull(withTimeoutOrNull(1_000L) { sessionStorageManager.awaitReturnChecked() })
+    }
+
+    @Test
+    fun `a wipe announces the epoch of the session it begins`() = runBlocking {
+        val renewed = async(start = CoroutineStart.UNDISPATCHED) { sessionStorageManager.listenSessionEpoch().first { epoch -> epoch > SessionEpoch(0L) } }
+
+        sessionStorageManager.clearSessionData()
+
+        assertEquals(SessionEpoch(1L), withTimeout(1_000L) { renewed.await() })
+    }
+}

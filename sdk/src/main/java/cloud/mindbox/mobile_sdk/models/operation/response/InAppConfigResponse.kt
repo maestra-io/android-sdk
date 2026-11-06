@@ -1,0 +1,273 @@
+package cloud.mindbox.mobile_sdk.models.operation.response
+
+import cloud.mindbox.mobile_sdk.inapp.data.dto.PayloadDto
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.FeatureTogglesDtoBlankDeserializer
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.InAppIsPriorityDeserializer
+import cloud.mindbox.mobile_sdk.models.Milliseconds
+import cloud.mindbox.mobile_sdk.models.TimeSpan
+import cloud.mindbox.mobile_sdk.models.TreeTargetingDto
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.annotations.SerializedName
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.SlidingExpirationDtoBlankDeserializer
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.InappSettingsDtoBlankDeserializer
+import com.google.gson.annotations.JsonAdapter
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.InAppDelayTimeDeserializer
+import cloud.mindbox.mobile_sdk.inapp.data.dto.deserializers.InAppTagsDeserializer
+
+internal data class InAppConfigResponse(
+    @SerializedName("inapps")
+    val inApps: List<InAppDto>?,
+    @SerializedName("monitoring")
+    val monitoring: List<LogRequestDto>?,
+    @SerializedName("settings")
+    val settings: SettingsDto?,
+    @SerializedName("abtests")
+    val abtests: List<ABTestDto>?,
+)
+
+internal data class SettingsDtoBlank(
+    @SerializedName("operations")
+    val operations: Map<String?, OperationDtoBlank?>?,
+    @SerializedName("ttl")
+    val ttl: TtlDtoBlank?,
+    @SerializedName("slidingExpiration")
+    val slidingExpiration: SlidingExpirationDtoBlank?,
+    @SerializedName("inapp")
+    val inappSettings: InappSettingsDtoBlank?,
+    @SerializedName("featureToggles")
+    val featureToggles: FeatureTogglesDtoBlank?,
+    @SerializedName("baseAddresses")
+    val baseAddresses: BaseAddressesDtoBlank?,
+) {
+
+    internal data class BaseAddressesDtoBlank(
+        @SerializedName("operations")
+        val operations: String?,
+    )
+
+    internal data class OperationDtoBlank(
+        @SerializedName("systemName")
+        val systemName: String
+    )
+
+    internal data class TtlDtoBlank(
+        @SerializedName("inapps")
+        val inApps: String
+    )
+
+    @JsonAdapter(SlidingExpirationDtoBlankDeserializer::class)
+    internal data class SlidingExpirationDtoBlank(
+        @SerializedName(SlidingExpirationDtoBlankDeserializer.CONFIG)
+        val config: TimeSpan?,
+        @SerializedName(SlidingExpirationDtoBlankDeserializer.PUSH_TOKEN_KEEP_ALIVE)
+        val pushTokenKeepalive: TimeSpan?,
+    )
+
+    @JsonAdapter(InappSettingsDtoBlankDeserializer::class)
+    internal data class InappSettingsDtoBlank(
+        @SerializedName(InappSettingsDtoBlankDeserializer.MAX_INAPPS_PER_SESSION)
+        val maxInappsPerSession: Int?,
+        @SerializedName(InappSettingsDtoBlankDeserializer.MAX_INAPPS_PER_DAY)
+        val maxInappsPerDay: Int?,
+        @SerializedName(InappSettingsDtoBlankDeserializer.MIN_INTERVAL_BETWEEN_SHOWS)
+        val minIntervalBetweenShows: TimeSpan?,
+    )
+
+    @JsonAdapter(FeatureTogglesDtoBlankDeserializer::class)
+    internal data class FeatureTogglesDtoBlank(
+        @SerializedName("toggles") val toggles: Map<String, Boolean?>
+    )
+}
+
+internal data class SettingsDto(
+    @SerializedName("operations")
+    val operations: Map<String, OperationDto>?,
+    @SerializedName("ttl")
+    val ttl: TtlDto?,
+    @SerializedName("slidingExpiration")
+    val slidingExpiration: SlidingExpirationDto?,
+    @SerializedName("inapp")
+    val inapp: InappSettingsDto?,
+    @SerializedName("featureToggles")
+    val featureToggles: Map<String, Boolean?>?,
+    @SerializedName("baseAddresses")
+    val baseAddresses: BaseAddressesDto? = null,
+)
+
+internal data class BaseAddressesDto(
+    @SerializedName("operations")
+    val operations: String?,
+)
+
+internal data class OperationDto(
+    @SerializedName("systemName")
+    val systemName: String
+)
+
+internal data class TtlDto(
+    @SerializedName("inapps")
+    val inApps: String
+)
+
+internal data class SlidingExpirationDto(
+    @SerializedName("config") val config: Milliseconds?,
+    @SerializedName("pushTokenKeepalive") val pushTokenKeepalive: Milliseconds?,
+)
+
+internal data class InappSettingsDto(
+    @SerializedName("maxInappsPerSession") val maxInappsPerSession: Int?,
+    @SerializedName("maxInappsPerDay") val maxInappsPerDay: Int?,
+    @SerializedName("minIntervalBetweenShows") val minIntervalBetweenShows: Milliseconds?,
+)
+
+internal data class LogRequestDto(
+    @SerializedName("requestId")
+    val requestId: String,
+    @SerializedName("target")
+    val target: String,
+    @SerializedName("from")
+    val from: String,
+    @SerializedName("to")
+    val to: String,
+)
+
+internal data class InAppDto(
+    @SerializedName("id")
+    val id: String,
+    @SerializedName(InAppIsPriorityDeserializer.IS_PRIORITY_INAPP)
+    val isPriority: Boolean,
+    @SerializedName(InAppDelayTimeDeserializer.INAPP_DELAY_TIME)
+    val delayTime: TimeSpan?,
+    @SerializedName("frequency")
+    val frequency: FrequencyDto,
+    @SerializedName("sdkVersion")
+    val sdkVersion: SdkVersion?,
+    @SerializedName("targeting")
+    val targeting: TreeTargetingDto?,
+    @SerializedName("form")
+    val form: FormDto?,
+    @SerializedName(InAppTagsDeserializer.TAGS)
+    val tags: Map<String, String>?,
+    @SerializedName("displayConditions")
+    val displayConditions: DisplayConditionsDto? = null,
+)
+
+internal sealed class DisplayConditionsDto {
+    internal data class DirectCallDto(
+        @SerializedName("${"$"}type")
+        val type: String?,
+    ) : DisplayConditionsDto() {
+        internal companion object {
+            const val DIRECT_CALL_JSON_NAME = "directCall"
+        }
+    }
+}
+
+internal sealed class FrequencyDto {
+    internal data class FrequencyOnceDto(
+        @SerializedName("${"$"}type")
+        val type: String,
+        @SerializedName("kind")
+        val kind: String
+    ) : FrequencyDto() {
+        internal companion object {
+            const val FREQUENCY_ONCE_JSON_NAME = "once"
+
+            const val FREQUENCY_KIND_LIFETIME = "lifetime"
+            const val FREQUENCY_KIND_SESSION = "session"
+        }
+    }
+
+    internal data class FrequencyPeriodicDto(
+        @SerializedName("${"$"}type")
+        val type: String,
+        @SerializedName("unit")
+        val unit: String,
+        @SerializedName("value")
+        val value: Long
+    ) : FrequencyDto() {
+        internal companion object {
+            const val FREQUENCY_PERIODIC_JSON_NAME = "periodic"
+
+            const val FREQUENCY_UNIT_HOURS = "HOURS"
+            const val FREQUENCY_UNIT_MINUTES = "MINUTES"
+            const val FREQUENCY_UNIT_DAYS = "DAYS"
+            const val FREQUENCY_UNIT_SECONDS = "SECONDS"
+        }
+    }
+
+    internal data class FrequencyUnlimitedDto(
+        @SerializedName("${"$"}type")
+        val type: String,
+    ) : FrequencyDto() {
+        internal companion object {
+            const val FREQUENCY_UNLIMITED_JSON_NAME = "unlimited"
+        }
+    }
+}
+
+internal data class SdkVersion(
+    @SerializedName("min")
+    val minVersion: Int?,
+    @SerializedName("max")
+    val maxVersion: Int?,
+)
+
+internal data class FormDto(
+    @SerializedName("variants")
+    val variants: List<PayloadDto?>?,
+)
+
+internal data class MonitoringDto(
+    @SerializedName("logs")
+    val logs: List<LogRequestDtoBlank>?,
+)
+
+internal data class LogRequestDtoBlank(
+    @SerializedName("requestId")
+    val requestId: String,
+    @SerializedName("target")
+    val target: String?,
+    @SerializedName("from")
+    val from: String,
+    @SerializedName("to")
+    val to: String,
+)
+
+internal data class InAppConfigResponseBlank(
+    @SerializedName("inapps")
+    val inApps: List<InAppDtoBlank>?,
+    @SerializedName("monitoring")
+    val monitoring: MonitoringDto?,
+    @SerializedName("settings")
+    val settings: SettingsDtoBlank?,
+    @SerializedName("abtests")
+    val abtests: List<ABTestDto>?,
+) {
+
+    internal data class InAppDtoBlank(
+        @SerializedName("id")
+        val id: String,
+        @SerializedName(InAppIsPriorityDeserializer.IS_PRIORITY_INAPP)
+        @JsonAdapter(InAppIsPriorityDeserializer::class)
+        val isPriority: Boolean,
+        @SerializedName(InAppDelayTimeDeserializer.INAPP_DELAY_TIME)
+        @JsonAdapter(InAppDelayTimeDeserializer::class)
+        val delayTime: String?,
+        @SerializedName("frequency")
+        val frequency: JsonElement?,
+        @SerializedName("sdkVersion")
+        val sdkVersion: SdkVersion?,
+        @SerializedName("targeting")
+        val targeting: JsonObject?,
+        // FormDto. Parsed after filtering inApp versions.
+        @SerializedName("form")
+        val form: JsonObject?,
+        @SerializedName("tags")
+        @JsonAdapter(InAppTagsDeserializer::class)
+        val tags: Map<String, String>?,
+        @SerializedName("displayConditions")
+        val displayConditions: JsonElement? = null,
+    )
+}

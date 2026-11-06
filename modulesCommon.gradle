@@ -1,0 +1,101 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+apply plugin: 'signing'
+apply plugin: 'org.jlleitschuh.gradle.ktlint'
+apply plugin: 'com.vanniktech.maven.publish'
+apply plugin: 'org.jetbrains.kotlinx.kover'
+apply plugin: 'io.gitlab.arturbosch.detekt'
+
+group = 'com.github.maestra-io'
+
+android {
+    compileSdkVersion libs.versions.compile.sdk.get().toInteger()
+    buildToolsVersion libs.versions.build.tools.get()
+
+    defaultConfig {
+        minSdkVersion libs.versions.min.sdk.get().toInteger()
+        targetSdkVersion libs.versions.target.sdk.get().toInteger()
+        versionCode 1
+        multiDexEnabled true
+        versionName '"' + SDK_VERSION_NAME + '"'
+
+        buildConfigField 'String', 'VERSION_NAME', '"' + SDK_VERSION_NAME + '"'
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            buildConfigField "Boolean", "DEBUG_MODE", "true"
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+
+    kotlin {
+        explicitApi()
+    }
+}
+
+detekt {
+    buildUponDefaultConfig = true
+    config.setFrom(files("${rootDir}/detekt.yml"))
+    source.setFrom(files("src/main/java", "src/main/kotlin"))
+}
+
+dependencies {
+    detektPlugins project(path: ':detekt-rules', configuration: 'runtimeElements')
+}
+
+kover {
+    currentProject {
+        createVariant("coverage") {
+            add(["debug"] as String[], false)
+        }
+    }
+}
+
+mavenPublishing {
+    publishToMavenCentral("CENTRAL_PORTAL")
+
+    if ((System.getenv("CI") == "true")) {
+        signAllPublications()
+    }
+
+    coordinates('cloud.mindbox', ARTIFACT_ID, SDK_VERSION_NAME)
+
+    pom {
+        name = ARTIFACT_NAME
+        description = 'Android Maestra SDK'
+        url = 'https://github.com/maestra-io/android-sdk'
+        developers {
+            developer {
+                id = 'Maestra'
+                name = 'Maestra'
+                email = 'support@maestra.io'
+            }
+        }
+
+        scm {
+            connection = 'scm:https://github.com/maestra-io/android-sdk.git'
+            developerConnection = 'scm:git://github.com/maestra-io/android-sdk.git'
+            url = 'https://github.com/maestra-io/android-sdk'
+        }
+    }
+}

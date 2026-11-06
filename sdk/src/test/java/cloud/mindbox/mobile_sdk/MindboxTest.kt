@@ -1,0 +1,374 @@
+package cloud.mindbox.mobile_sdk
+
+import android.app.Application
+import android.content.Context
+import cloud.mindbox.mobile_sdk.di.MindboxDI
+import cloud.mindbox.mobile_sdk.inapp.domain.interfaces.repositories.MobileConfigRepository
+import cloud.mindbox.mobile_sdk.inapp.presentation.InAppMessageManager
+import cloud.mindbox.mobile_sdk.managers.DbManager
+import cloud.mindbox.mobile_sdk.managers.MindboxEventManager
+import cloud.mindbox.mobile_sdk.managers.TrackingIdsResolver
+import cloud.mindbox.mobile_sdk.models.TrackingId
+import cloud.mindbox.mobile_sdk.models.InitData
+import cloud.mindbox.mobile_sdk.models.TokenData
+import cloud.mindbox.mobile_sdk.models.UpdateData
+import cloud.mindbox.mobile_sdk.pushes.PrefPushToken
+import cloud.mindbox.mobile_sdk.pushes.PushNotificationManager
+import cloud.mindbox.mobile_sdk.pushes.PushServiceHandler
+import cloud.mindbox.mobile_sdk.pushes.PushToken
+import cloud.mindbox.mobile_sdk.repository.MindboxPreferences
+import cloud.mindbox.mobile_sdk.services.BackgroundWorkManager
+import cloud.mindbox.mobile_sdk.utils.setMindboxScope
+import io.mockk.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Before
+import org.junit.Test
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.UUID
+
+class MindboxTest {
+
+    private val context = mockk<Context> {
+        every { applicationContext } returns mockk<Application>(relaxed = true)
+    }
+
+    private val firstProvider = mockk<PushServiceHandler> {
+        every { notificationProvider } returns "FCM"
+        coEvery { registerToken(any(), any()) } returns "tokenFCM"
+    }
+
+    private val secondProvider = mockk<PushServiceHandler> {
+        every { notificationProvider } returns "HMS"
+        coEvery { registerToken(any(), any()) } returns "tokenHMS"
+    }
+
+    private val trackingIdsResolver = mockk<TrackingIdsResolver>()
+
+    private val thirdProvider = mockk<PushServiceHandler> {
+        every { notificationProvider } returns "RuStore"
+        coEvery { registerToken(any(), any()) } returns "tokenRuStore"
+    }
+
+    @Before
+    fun setUp() {
+        mockkObject(MindboxDI)
+        coEvery { trackingIdsResolver.resolve(any()) } returns emptyList()
+        every { trackingIdsResolver.hasChanged(any()) } returns false
+        every { trackingIdsResolver.markSent(any()) } just runs
+        every { MindboxDI.appModule } returns mockk(relaxed = true) {
+            every { trackingIdsResolver } returns this@MindboxTest.trackingIdsResolver
+        }
+        mockkObject(MindboxPreferences)
+        mockkObject(PushNotificationManager)
+        mockkObject(MindboxEventManager)
+        every { MindboxPreferences.pushTokens } returns mapOf(
+            "FCM" to PrefPushToken("tokenFCM", 1L),
+            "HMS" to PrefPushToken("tokenHMS", 2L),
+            "RuStore" to PrefPushToken("tokenRuStore", 3L),
+        )
+        every { PushNotificationManager.isNotificationsEnabled(any()) } returns true
+        every { MindboxPreferences.isNotificationEnabled } returns true
+        every { MindboxPreferences.instanceId } returns "instanceId"
+        every { MindboxPreferences.deviceUuid } returns "deviceUUID"
+        every { MindboxPreferences.firstInitializationTime } returns null
+        every { MindboxPreferences.firstInitializationTime = any() } just runs
+        every { MindboxPreferences.infoUpdatedVersion } returns 1
+
+        Mindbox.pushServiceHandlers = listOf(firstProvider, secondProvider, thirdProvider)
+    }
+
+    @Test
+    fun `updateAppInfo not call appInfoUpdate when no token`() = runTest {
+        Mindbox.updateAppInfo(context)
+
+        verify(exactly = 0) { MindboxEventManager.appInfoUpdate(context, any()) }
+    }
+
+    @Test
+    fun `updateAppInfo calls appInfoUpdate when only the tracking ids changed`() = runTest {
+        val trackingIds = listOf(TrackingId("google", "38400000-8cf0-11bd-b23e-10b96e40000d"))
+        coEvery { trackingIdsResolver.resolve(any()) } returns trackingIds
+        every { trackingIdsResolver.hasChanged(trackingIds) } returns true
+
+        Mindbox.updateAppInfo(context, PushToken("FCM", "tokenFCM"))
+
+        verify(exactly = 1) { MindboxEventManager.appInfoUpdate(context, any()) }
+        verify(exactly = 1) { trackingIdsResolver.markSent(trackingIds) }
+    }
+
+    @Test
+    fun `updateAppInfo does not call appInfoUpdate when the tracking ids are unchanged`() = runTest {
+        val trackingIds = listOf(TrackingId("google", "38400000-8cf0-11bd-b23e-10b96e40000d"))
+        coEvery { trackingIdsResolver.resolve(any()) } returns trackingIds
+        every { trackingIdsResolver.hasChanged(trackingIds) } returns false
+
+        Mindbox.updateAppInfo(context, PushToken("FCM", "tokenFCM"))
+
+        verify(exactly = 0) { MindboxEventManager.appInfoUpdate(context, any()) }
+        verify(exactly = 0) { trackingIdsResolver.markSent(any()) }
+    }
+
+    @Test
+    fun `updateAppInfo not call appInfoUpdate when token not changed`() = runTest {
+        Mindbox.updateAppInfo(context, PushToken("FCM", "tokenFCM"))
+
+        verify(exactly = 0) { MindboxEventManager.appInfoUpdate(context, any()) }
+    }
+
+    @Test
+    fun `updateAppInfo not call appInfoUpdate when tokens not provided`() = runTest {
+        coEvery { firstProvider.registerToken(context, any()) } returns null
+        coEvery { secondProvider.registerToken(context, any()) } returns null
+        coEvery { thirdProvider.registerToken(context, any()) } returns null
+
+        Mindbox.updateAppInfo(context)
+
+        verify(exactly = 0) { MindboxEventManager.appInfoUpdate(context, any()) }
+    }
+
+    @Test
+    fun `updateAppInfo call appInfoUpdate when tokens not saved`() = runTest {
+        every { MindboxPreferences.pushTokens } returns mapOf()
+
+        Mindbox.updateAppInfo(context)
+
+        verify(exactly = 1) {
+            MindboxEventManager.appInfoUpdate(
+                context,
+                UpdateData(
+                    isNotificationsEnabled = true,
+                    instanceId = "instanceId",
+                    version = 1,
+                    tokens = listOf(
+                        TokenData(token = "tokenFCM", notificationProvider = "FCM"),
+                        TokenData(token = "tokenHMS", notificationProvider = "HMS"),
+                        TokenData(token = "tokenRuStore", notificationProvider = "RuStore"),
+                    ),
+                    trackingIds = emptyList(),
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `updateAppInfo call appInfoUpdate when token changed`() = runTest {
+        coEvery { firstProvider.registerToken(context, any()) } returns "NEW_TOKEN"
+
+        Mindbox.updateAppInfo(context, PushToken("FCM", "NEW_TOKEN"))
+
+        verify(exactly = 1) {
+            MindboxEventManager.appInfoUpdate(
+                context,
+                UpdateData(
+                    isNotificationsEnabled = true,
+                    instanceId = "instanceId",
+                    version = 1,
+                    tokens = listOf(
+                        TokenData(token = "NEW_TOKEN", notificationProvider = "FCM"),
+                        TokenData(token = "tokenHMS", notificationProvider = "HMS"),
+                        TokenData(token = "tokenRuStore", notificationProvider = "RuStore"),
+                    ),
+                    trackingIds = emptyList(),
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `updateAppInfo not call appInfoUpdate when null token provided`() = runTest {
+        coEvery { thirdProvider.registerToken(any(), any()) } returns null
+
+        Mindbox.updateAppInfo(context)
+
+        verify(exactly = 0) { MindboxEventManager.appInfoUpdate(context, any()) }
+    }
+
+    @Test
+    fun `updateAppInfo call appInfoUpdate when null and new tokens provided`() = runTest {
+        coEvery { thirdProvider.registerToken(any(), any()) } returns null
+        coEvery { secondProvider.registerToken(any(), any()) } returns "NEW_TOKEN"
+
+        Mindbox.updateAppInfo(context)
+
+        verify(exactly = 1) {
+            MindboxEventManager.appInfoUpdate(
+                context, UpdateData(
+                    isNotificationsEnabled = true,
+                    instanceId = "instanceId",
+                    version = 1,
+                    tokens = listOf(
+                        TokenData(token = "tokenFCM", notificationProvider = "FCM"),
+                        TokenData(token = "NEW_TOKEN", notificationProvider = "HMS"),
+                        TokenData(token = "tokenRuStore", notificationProvider = "RuStore"),
+                    ),
+                    trackingIds = emptyList(),
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `updateAppInfo call appInfoUpdate when token provided`() = runTest {
+        every { MindboxPreferences.pushTokens } returns mapOf()
+
+        Mindbox.updateAppInfo(context, PushToken("HMS", "tokenHMS"))
+
+        verify(exactly = 1) {
+            MindboxEventManager.appInfoUpdate(
+                context, UpdateData(
+                    isNotificationsEnabled = true,
+                    instanceId = "instanceId",
+                    version = 1,
+                    tokens = listOf(
+                        TokenData(token = "tokenFCM", notificationProvider = "FCM"),
+                        TokenData(token = "tokenHMS", notificationProvider = "HMS"),
+                        TokenData(token = "tokenRuStore", notificationProvider = "RuStore"),
+                    ),
+                    trackingIds = emptyList(),
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `firstInitialization call appInfoUpdate`() = runTest {
+        val uuid = UUID.fromString("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        mockkStatic(UUID::class)
+        try {
+            every { UUID.randomUUID() } returns uuid
+            coEvery { firstProvider.getAdsIdentification(context) } returns "adsId"
+            coEvery { secondProvider.getAdsIdentification(context) } returns "adsId"
+            coEvery { thirdProvider.getAdsIdentification(context) } returns "adsId"
+            every { MindboxPreferences.pushTokens } returns mapOf()
+
+            Mindbox.firstInitialization(context, mockk(relaxed = true))
+
+            verify(exactly = 1) {
+                MindboxEventManager.appInstalled(
+                    context,
+                    InitData(
+                        isNotificationsEnabled = true,
+                        externalDeviceUUID = "",
+                        instanceId = uuid.toString(),
+                        version = 0,
+                        subscribe = false,
+                        installationId = "",
+                        ianaTimeZone = null,
+                        tokens = listOf(
+                            TokenData(token = "tokenFCM", notificationProvider = "FCM"),
+                            TokenData(token = "tokenHMS", notificationProvider = "HMS"),
+                            TokenData(token = "tokenRuStore", notificationProvider = "RuStore"),
+                        ),
+                        trackingIds = emptyList(),
+                    ),
+                    any()
+                )
+            }
+        } finally {
+            unmockkStatic(UUID::class)
+        }
+    }
+
+    @Test
+    fun `firstInitialization does not override saved first initialization time`() = runTest {
+        every { MindboxPreferences.firstInitializationTime } returns "2025-01-10T07:40:00Z"
+
+        Mindbox.firstInitialization(context, mockk(relaxed = true))
+
+        verify(exactly = 0) {
+            MindboxPreferences.firstInitializationTime = any()
+        }
+    }
+
+    @Test
+    fun `firstInitializationDateTime saved when first initialization time`() = runTest {
+        every { MindboxPreferences.firstInitializationTime } returns null
+
+        Mindbox.firstInitialization(context, mockk(relaxed = true))
+
+        verify(exactly = 1) {
+            MindboxPreferences.firstInitializationTime = any()
+        }
+    }
+
+    @Test
+    fun `getPushTokensSaveDate returns correctly map`() {
+        val tokensDate = Mindbox.getPushTokensSaveDate()
+        assertEquals(
+            mapOf(
+                "FCM" to 1L,
+                "HMS" to 2L,
+                "RuStore" to 3L,
+            ), tokensDate
+        )
+    }
+
+    @Test
+    @Suppress("DEPRECATION_ERROR")
+    fun `getPushTokenSaveDate returns correctly map`() {
+        every { MindboxPreferences.pushTokens } returns mapOf(
+            "TEST" to PrefPushToken("tokenRuStore", 1736502001L)
+        )
+
+        val timestamp: Long? = SimpleDateFormat(
+            "EEE MMM dd HH:mm:ss zzz yyyy",
+            Locale.ENGLISH
+        ).parse(Mindbox.getPushTokenSaveDate())?.time
+
+        assertEquals(1736502000L, timestamp)
+    }
+
+    @Test
+    fun `a soft re-init that abandons the awaited config download requests the config once`() {
+        val repository = mockk<MobileConfigRepository> { every { abandonAwaitedDownload() } returns true }
+        val inAppManager = mockk<InAppMessageManager>(relaxed = true)
+
+        Mindbox.restartAwaitedConfigDownload(repository) { inAppManager }
+
+        verify(exactly = 1) { inAppManager.requestConfig() }
+    }
+
+    @Test
+    fun `a soft re-init requests no config when no download is awaited`() {
+        val repository = mockk<MobileConfigRepository> { every { abandonAwaitedDownload() } returns false }
+
+        Mindbox.restartAwaitedConfigDownload(repository) { error("resolved without an abandoned download") }
+    }
+
+    @Test
+    fun `a soft re-init before the config repository exists requests no config`() {
+        Mindbox.restartAwaitedConfigDownload(null) { error("resolved without an abandoned download") }
+    }
+
+    @Test
+    fun `a soft re-init requests the abandoned config once after the repository listens again`() {
+        val repository = mockk<MobileConfigRepository>(relaxed = true) { every { abandonAwaitedDownload() } returns true }
+        val inAppManager = mockk<InAppMessageManager>(relaxed = true)
+        val appModule = MindboxDI.appModule
+        every { appModule.mobileConfigRepositoryIfCreated } returns repository
+        every { appModule.inAppMessageManager } returns inAppManager
+        every { MindboxPreferences.resetAppInfoUpdated() } just runs
+        mockkObject(DbManager, BackgroundWorkManager)
+        val originalScope = Mindbox.mindboxScope
+        try {
+            every { DbManager.removeAllEventsFromQueue() } just runs
+            every { BackgroundWorkManager.cancelAllWork(any()) } returns mockk()
+            setMindboxScope(CoroutineScope(Dispatchers.Unconfined))
+
+            Mindbox.softReinitialization(context)
+
+            verify(exactly = 1) { inAppManager.requestConfig() }
+            verifyOrder {
+                repository.startListening()
+                inAppManager.requestConfig()
+            }
+        } finally {
+            setMindboxScope(originalScope)
+            unmockkObject(DbManager, BackgroundWorkManager)
+        }
+    }
+}

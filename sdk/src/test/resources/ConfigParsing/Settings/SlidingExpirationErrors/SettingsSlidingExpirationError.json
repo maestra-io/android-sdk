@@ -1,0 +1,20 @@
+{
+  "operations": {
+    "viewProduct": {
+      "systemName": "ViewProduct"
+    },
+    "viewCategory": {
+      "systemName": "ViewCategory"
+    },
+    "setCart": {
+      "systemName": "SetCart"
+    }
+  },
+  "ttl": {
+    "inapps": "1.00:00:00"
+  },
+  "slidingExpirationTest": {
+    "config": "0.00:30:00",
+    "pushTokenKeepalive": "0.00:30:00"
+  }
+}
